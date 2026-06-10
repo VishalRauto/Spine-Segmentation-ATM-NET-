@@ -1,0 +1,57 @@
+# SPIDER-specific training config (overrides base_config.yaml)
+# Tuned for the SPIDER lumbar spine MRI dataset
+
+_base_: base_config.yaml
+
+training:
+  epochs: 150
+  batch_size: 8
+  accumulation_steps: 2
+  mixed_precision: true
+  seed: 42
+
+  optimizer:
+    name: "adamw"
+    lr: 2.0e-4
+    weight_decay: 1.0e-5
+    betas: [0.9, 0.999]
+
+  scheduler:
+    name: "cosine_warmup"
+    warmup_epochs: 15
+    min_lr: 1.0e-6
+
+  early_stopping:
+    patience: 25
+    min_delta: 0.002
+    monitor: "val_dice"
+
+  loss:
+    seg_dice_weight: 1.0
+    seg_focal_weight: 0.5
+    seg_boundary_weight: 0.15
+    cls_weight: 0.25
+    severity_weight: 0.15
+    level_weight: 0.15
+    report_weight: 0.05
+
+augmentation:
+  rotation_range: 10
+  flip_prob: 0.5
+  elastic_alpha: 80
+  elastic_sigma: 8
+  intensity_shift: 0.08
+  intensity_scale: 0.08
+  gaussian_noise_std: 0.008
+  random_crop_size: [448, 448]
+  zoom_range: [0.92, 1.08]
+
+model:
+  img_size: [512, 512]
+  feature_size: 48
+  in_channels: 1
+  out_channels: 20
+
+data:
+  modalities: ["t1", "t2"]
+  image_size: [512, 512]

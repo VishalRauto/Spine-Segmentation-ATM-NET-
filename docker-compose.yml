@@ -1,0 +1,138 @@
+version: "3.9"
+
+# ATM-Net++ Full Stack Docker Compose
+# Services: backend, frontend, db, redis, nginx
+
+networks:
+  atmnet:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  redis_data:
+  uploads_data:
+  outputs_data:
+  checkpoints_data:
+
+services:
+
+  # ── PostgreSQL ───────────────────────────────────────────────────
+  db:
+    image: postgres:16-alpine
+    container_name: atmnet_db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: atmnet
+      POSTGRES_PASSWORD: atmnet_pass
+      POSTGRES_DB: atmnet_db
+      PGDATA: /var/lib/postgresql/data/pgdata
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./deployment/docker/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    ports:
+      - "5432:5432"
+    networks:
+      - atmnet
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U atmnet -d atmnet_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── Redis ─────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: atmnet_redis
+    restart: unless-stopped
+    command: redis-server --maxmemory 256mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6379:6379"
+    networks:
+      - atmnet
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── Backend (FastAPI) ─────────────────────────────────────────────
+  backend:
+    build:
+      context: .
+      dockerfile: deployment/docker/Dockerfile.backend
+    container_name: atmnet_backend
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://atmnet:atmnet_pass@db:5432/atmnet_db
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/1
+      CELERY_RESULT_BACKEND: redis://redis:6379/2
+      MODEL_CHECKPOINT_PATH: /app/checkpoints/atmnet_pp_best.pth
+      MODEL_CONFIG_PATH: /app/configs/base_config.yaml
+      MODEL_DEVICE: cpu
+      UPLOAD_DIR: /app/uploads
+      CORS_ORIGINS: '["http://localhost:3000","http://frontend:3000"]'
+    volumes:
+      - uploads_data:/app/uploads
+      - outputs_data:/app/outputs
+      - checkpoints_data:/app/checkpoints
+      - ./configs:/app/configs:ro
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - atmnet
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      start_period: 90s
+      retries: 3
+
+  # ── Frontend (Next.js) ────────────────────────────────────────────
+  frontend:
+    build:
+      context: .
+      dockerfile: deployment/docker/Dockerfile.frontend
+    container_name: atmnet_frontend
+    restart: unless-stopped
+    environment:
+      NEXT_PUBLIC_API_URL: http://localhost:8000/api/v1
+    ports:
+      - "3000:3000"
+    depends_on:
+      backend:
+        condition: service_healthy
+    networks:
+      - atmnet
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3000"]
+      interval: 30s
+      timeout: 10s
+      start_period: 30s
+      retries: 3
+
+  # ── Nginx reverse proxy ───────────────────────────────────────────
+  nginx:
+    image: nginx:1.25-alpine
+    container_name: atmnet_nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./deployment/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./deployment/nginx/ssl:/etc/nginx/ssl:ro
+    depends_on:
+      - backend
+      - frontend
+    networks:
+      - atmnet

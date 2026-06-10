@@ -1,0 +1,18 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --background: 0 0% 100%;
+    --foreground: 222.2 84% 4.9%;
+    --primary: 221.2 83.2% 53.3%;
+  }
+  * { box-sizing: border-box; }
+  body { @apply antialiased text-gray-900 bg-gray-50; }
+  h1,h2,h3,h4,h5,h6 { @apply font-semibold; }
+}
+
+@layer utilities {
+  .text-balance { text-wrap: balance; }
+}

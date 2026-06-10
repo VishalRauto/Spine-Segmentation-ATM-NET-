@@ -1,0 +1,175 @@
+# ATM-Net++ Base Configuration
+project:
+  name: "ATM-Net++"
+  version: "1.0.0"
+  description: "Anatomy-Aware Multimodal Lumbar Spine MRI Diagnostic and Segmentation System"
+
+paths:
+  data_root: "data/10159290"
+  images_dir: "data/10159290/images"
+  masks_dir: "data/10159290/masks"
+  overview_csv: "data/10159290/overview.csv"
+  gradings_csv: "data/10159290/radiological_gradings.csv"
+  checkpoints_dir: "checkpoints"
+  logs_dir: "logs"
+  outputs_dir: "outputs"
+
+model:
+  name: "atmnet_plus_plus"
+  backbone: "swin_unetr"
+  pretrained: true
+  img_size: [512, 512]
+  in_channels: 1
+  out_channels: 20
+  feature_size: 48
+  drop_rate: 0.0
+  attn_drop_rate: 0.0
+  dropout_path_rate: 0.1
+  use_checkpoint: true
+  spatial_dims: 2
+
+segmentation:
+  num_classes: 20
+  class_names:
+    - background
+    - T10
+    - T11
+    - T12
+    - L1
+    - L2
+    - L3
+    - L4
+    - L5
+    - S1
+    - T10_T11_disc
+    - T11_T12_disc
+    - T12_L1_disc
+    - L1_L2_disc
+    - L2_L3_disc
+    - L3_L4_disc
+    - L4_L5_disc
+    - L5_S1_disc
+    - spinal_canal
+    - spinal_cord
+
+classification:
+  num_disease_classes: 7
+  disease_names:
+    - Normal
+    - Disc_Herniation
+    - Disc_Bulge
+    - Spinal_Stenosis
+    - Degenerative_Disc_Disease
+    - Spondylolisthesis
+    - Compression_Fracture
+  num_severity_classes: 3
+  severity_names:
+    - Mild
+    - Moderate
+    - Severe
+  num_ivd_labels: 8
+
+text_encoder:
+  model_name: "emilyalsentzer/Bio_ClinicalBERT"
+  max_length: 512
+  embedding_dim: 768
+  freeze_layers: 6
+
+demographic:
+  input_dim: 8
+  hidden_dims: [64, 128, 256]
+  output_dim: 256
+  dropout: 0.2
+
+fusion:
+  image_feat_dim: 768
+  text_feat_dim: 768
+  demo_feat_dim: 256
+  fusion_dim: 512
+  num_heads: 8
+  num_layers: 4
+  dropout: 0.1
+
+training:
+  epochs: 200
+  batch_size: 4
+  num_workers: 4
+  pin_memory: true
+  accumulation_steps: 4
+  mixed_precision: true
+  seed: 42
+  optimizer:
+    name: "adamw"
+    lr: 1.0e-4
+    weight_decay: 1.0e-5
+    betas: [0.9, 0.999]
+  scheduler:
+    name: "cosine_warmup"
+    warmup_epochs: 10
+    min_lr: 1.0e-6
+  early_stopping:
+    patience: 30
+    min_delta: 0.001
+    monitor: "val_dice"
+  loss:
+    seg_dice_weight: 1.0
+    seg_focal_weight: 0.5
+    seg_boundary_weight: 0.2
+    cls_weight: 0.3
+    severity_weight: 0.2
+    level_weight: 0.2
+    report_weight: 0.1
+  cross_validation:
+    n_folds: 5
+
+augmentation:
+  rotation_range: 15
+  flip_prob: 0.5
+  elastic_alpha: 100
+  elastic_sigma: 10
+  intensity_shift: 0.1
+  intensity_scale: 0.1
+  gaussian_noise_std: 0.01
+  random_crop_size: [480, 480]
+  zoom_range: [0.9, 1.1]
+
+data:
+  train_split: 0.7
+  val_split: 0.15
+  test_split: 0.15
+  image_size: [512, 512]
+  normalize_mean: 0.5
+  normalize_std: 0.5
+  modalities: ["t1", "t2"]
+
+inference:
+  threshold: 0.5
+  tta: true
+  tta_flips: [[0], [1], [0, 1]]
+  batch_size: 1
+
+explainability:
+  gradcam_layer: "encoder.layers.3"
+  attention_rollout: true
+  segmentation_overlay_alpha: 0.4
+
+api:
+  host: "0.0.0.0"
+  port: 8000
+  workers: 4
+  max_upload_size_mb: 500
+  jwt_algorithm: "HS256"
+  access_token_expire_minutes: 60
+
+database:
+  host: "db"
+  port: 5432
+  name: "atmnet_db"
+  pool_size: 10
+  max_overflow: 20
+
+wandb:
+  project: "atmnet-plus-plus"
+  entity: "spine-ai-lab"
+  log_model: true
+  log_images: true

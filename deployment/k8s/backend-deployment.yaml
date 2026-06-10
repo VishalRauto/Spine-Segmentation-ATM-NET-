@@ -1,0 +1,132 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: atmnet-backend
+  namespace: atmnet
+  labels:
+    app: atmnet-backend
+    version: "1.0.0"
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: atmnet-backend
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app: atmnet-backend
+    spec:
+      containers:
+        - name: backend
+          image: ghcr.io/your-org/atmnet-backend:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8000
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: atmnet-secrets
+                  key: database-url
+            - name: SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: atmnet-secrets
+                  key: secret-key
+            - name: REDIS_URL
+              value: "redis://atmnet-redis:6379/0"
+            - name: MODEL_DEVICE
+              value: "cpu"
+            - name: MODEL_CHECKPOINT_PATH
+              value: "/app/checkpoints/atmnet_pp_best.pth"
+          resources:
+            requests:
+              memory: "2Gi"
+              cpu: "500m"
+            limits:
+              memory: "8Gi"
+              cpu: "4000m"
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 90
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          volumeMounts:
+            - name: uploads
+              mountPath: /app/uploads
+            - name: checkpoints
+              mountPath: /app/checkpoints
+              readOnly: true
+            - name: outputs
+              mountPath: /app/outputs
+      volumes:
+        - name: uploads
+          persistentVolumeClaim:
+            claimName: atmnet-uploads-pvc
+        - name: checkpoints
+          persistentVolumeClaim:
+            claimName: atmnet-checkpoints-pvc
+        - name: outputs
+          persistentVolumeClaim:
+            claimName: atmnet-outputs-pvc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: atmnet-backend
+  namespace: atmnet
+spec:
+  selector:
+    app: atmnet-backend
+  ports:
+    - protocol: TCP
+      port: 8000
+      targetPort: 8000
+  type: ClusterIP
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: atmnet-uploads-pvc
+  namespace: atmnet
+spec:
+  accessModes: [ReadWriteMany]
+  resources:
+    requests:
+      storage: 50Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: atmnet-checkpoints-pvc
+  namespace: atmnet
+spec:
+  accessModes: [ReadOnlyMany]
+  resources:
+    requests:
+      storage: 10Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: atmnet-outputs-pvc
+  namespace: atmnet
+spec:
+  accessModes: [ReadWriteMany]
+  resources:
+    requests:
+      storage: 20Gi
