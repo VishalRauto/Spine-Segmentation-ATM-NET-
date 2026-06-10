@@ -61,3 +61,6 @@ uploads/
 # ── Keep outputs structure but not binary files ───────────────────────
 !outputs/.gitkeep
 !checkpoints/.gitkeep
+
+# CI workflow (needs workflow PAT scope to push)
+.github/
