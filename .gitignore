@@ -62,5 +62,3 @@ uploads/
 !outputs/.gitkeep
 !checkpoints/.gitkeep
 
-# CI workflow (needs workflow PAT scope to push)
-.github/
