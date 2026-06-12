@@ -7,13 +7,50 @@ import numpy as np
 import cv2
 
 BASE       = Path(__file__).parent
-CKPT_GPU   = BASE / "outputs/gpu_run/best_model.pth"
+CKPT_BEST  = BASE / "outputs/gpu_run/best_model.pth"
+CKPT_LAST  = BASE / "outputs/gpu_run/last_model.pth"
 CKPT_CPU   = BASE / "outputs/high_perf_run/best_model.pth"
 HIST_GPU   = BASE / "outputs/gpu_run/history.json"
 HIST_CPU   = BASE / "outputs/high_perf_run/history.json"
 UPLOAD_DIR = BASE / "outputs/uploads"
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-CKPT = CKPT_GPU if CKPT_GPU.exists() else (CKPT_CPU if CKPT_CPU.exists() else None)
+
+def _pick_ckpt():
+    """Pick the best compatible checkpoint — prefers highest epoch count (most trained)."""
+    import torch
+    candidates = [
+        BASE / "outputs/gpu_run/last_model.pth",        # epoch 138 — most trained local
+        BASE / "outputs/gpu_run/best_model.pth",         # may be overwritten by kaggle
+        CKPT_CPU,
+    ]
+    best_path, best_ep, best_dice = None, -1, -1.0
+    for p in candidates:
+        if not p.exists():
+            continue
+        try:
+            c = torch.load(str(p), map_location="cpu")
+            keys = list(c.get("model_state_dict", {}).keys())
+            # Full compatibility: needs enc conv keys AND sa.conv keys
+            has_enc_conv = any(k == "e1.conv.0.weight" for k in keys)
+            has_sa_conv  = any("sa.conv.0.weight" in k  for k in keys)
+            if not (has_enc_conv and has_sa_conv):
+                print(f"  [ckpt] Skipping {p.name} — incompatible")
+                continue
+            ep   = c.get("epoch", 0)
+            dice = c.get("best_dice", 0.0)
+            print(f"  [ckpt] {p.name}: epoch={ep} dice={dice:.4f} ✓")
+            # Prefer most-trained (highest epoch) — more training = better feature maps
+            if ep > best_ep:
+                best_ep, best_dice, best_path = ep, dice, p
+        except Exception as e:
+            print(f"  [ckpt] {p.name}: error — {e}")
+    if best_path:
+        print(f"  [ckpt] Using: {best_path.name} (epoch={best_ep}, dice={best_dice:.4f})")
+    else:
+        print("  [ckpt] WARNING: No compatible checkpoint found.")
+    return best_path
+
+CKPT = _pick_ckpt()
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 500 * 1024 * 1024
@@ -53,55 +90,82 @@ def get_model():
         if _model is not None: return _model, _device
         import torch, torch.nn as nn, torch.nn.functional as F
         _device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        # ── Architecture MUST match train_best.py exactly ──────────────
         class CA(nn.Module):
             def __init__(self,ch,r=8):
                 super().__init__()
                 r=max(1,ch//r)
-                self.avg=nn.AdaptiveAvgPool2d(1);self.max=nn.AdaptiveMaxPool2d(1)
+                self.avg=nn.AdaptiveAvgPool2d(1); self.max=nn.AdaptiveMaxPool2d(1)
                 self.fc=nn.Sequential(nn.Flatten(),nn.Linear(ch,r),nn.ReLU(True),nn.Linear(r,ch),nn.Sigmoid())
             def forward(self,x):
                 a=self.fc(self.avg(x))+self.fc(self.max(x))
                 return x*a.clamp(0,1).view(x.shape[0],-1,1,1)
+
         class SA(nn.Module):
             def __init__(self):
                 super().__init__()
                 self.conv=nn.Sequential(nn.Conv2d(2,1,7,padding=3,bias=False),nn.BatchNorm2d(1),nn.Sigmoid())
-            def forward(self,x): return x*self.conv(torch.cat([x.mean(1,keepdim=True),x.max(1,keepdim=True)[0]],1))
+            def forward(self,x):
+                return x*self.conv(torch.cat([x.mean(1,keepdim=True),x.max(1,keepdim=True)[0]],1))
+
         class RB(nn.Module):
             def __init__(self,ch):
                 super().__init__()
-                self.net=nn.Sequential(nn.Conv2d(ch,ch,3,1,1,bias=False),nn.BatchNorm2d(ch),nn.ReLU(True),nn.Conv2d(ch,ch,3,1,1,bias=False),nn.BatchNorm2d(ch))
-                self.ca=CA(ch);self.sa=SA();self.act=nn.ReLU(True)
+                self.net=nn.Sequential(nn.Conv2d(ch,ch,3,1,1,bias=False),nn.BatchNorm2d(ch),nn.ReLU(True),
+                                       nn.Conv2d(ch,ch,3,1,1,bias=False),nn.BatchNorm2d(ch))
+                self.ca=CA(ch); self.sa=SA(); self.act=nn.ReLU(True)
             def forward(self,x): return self.act(self.sa(self.ca(self.net(x)))+x)
+
         class Enc(nn.Module):
-            def __init__(self,ci,co):
+            # drop param required — matches train_best.py Enc(ci, co, drop=0.0)
+            def __init__(self,ci,co,drop=0.0):
                 super().__init__()
-                self.conv=nn.Sequential(nn.Conv2d(ci,co,3,1,1,bias=False),nn.BatchNorm2d(co),nn.ReLU(True),nn.Conv2d(co,co,3,1,1,bias=False),nn.BatchNorm2d(co),nn.ReLU(True))
+                self.conv=nn.Sequential(nn.Conv2d(ci,co,3,1,1,bias=False),nn.BatchNorm2d(co),nn.ReLU(True),
+                                        nn.Conv2d(co,co,3,1,1,bias=False),nn.BatchNorm2d(co),nn.ReLU(True))
                 self.res=RB(co)
-            def forward(self,x): return self.res(self.conv(x))
+                self.drop=nn.Dropout2d(drop) if drop>0 else nn.Identity()
+            def forward(self,x): return self.drop(self.res(self.conv(x)))
+
         class ResUNet(nn.Module):
-            def __init__(self,b=32,nc=NUM_CLASSES):
+            # Exact replica of train_best.py ResUNet — includes ds3, ds2, aux head
+            def __init__(self,b=32,nc=NUM_CLASSES,drop=0.25):
                 super().__init__()
-                self.e1=Enc(1,b);self.e2=Enc(b,b*2);self.e3=Enc(b*2,b*4);self.e4=Enc(b*4,b*8)
-                self.bn=nn.Sequential(Enc(b*8,b*16),nn.Dropout2d(0.2));self.pool=nn.MaxPool2d(2)
-                self.u4=nn.ConvTranspose2d(b*16,b*8,2,2);self.d4=Enc(b*16,b*8)
-                self.u3=nn.ConvTranspose2d(b*8,b*4,2,2);self.d3=Enc(b*8,b*4)
-                self.u2=nn.ConvTranspose2d(b*4,b*2,2,2);self.d2=Enc(b*4,b*2)
-                self.u1=nn.ConvTranspose2d(b*2,b,2,2);self.d1=Enc(b*2,b)
-                self.ds3=nn.Conv2d(b*4,nc,1);self.ds2=nn.Conv2d(b*2,nc,1);self.out=nn.Conv2d(b,nc,1)
+                self.e1=Enc(1,b); self.e2=Enc(b,b*2,drop*0.3)
+                self.e3=Enc(b*2,b*4,drop*0.6); self.e4=Enc(b*4,b*8,drop*0.8)
+                self.bn=nn.Sequential(Enc(b*8,b*16,drop),nn.Dropout2d(drop))
+                self.pool=nn.MaxPool2d(2)
+                self.u4=nn.ConvTranspose2d(b*16,b*8,2,2); self.d4=Enc(b*16,b*8,drop*0.4)
+                self.u3=nn.ConvTranspose2d(b*8,b*4,2,2);  self.d3=Enc(b*8,b*4,drop*0.2)
+                self.u2=nn.ConvTranspose2d(b*4,b*2,2,2);  self.d2=Enc(b*4,b*2)
+                self.u1=nn.ConvTranspose2d(b*2,b,2,2);    self.d1=Enc(b*2,b)
+                self.ds3=nn.Conv2d(b*4,nc,1); self.ds2=nn.Conv2d(b*2,nc,1); self.out=nn.Conv2d(b,nc,1)
+                self.aux=nn.Sequential(nn.Conv2d(b,b,3,1,1,bias=False),nn.BatchNorm2d(b),nn.ReLU(True),nn.Conv2d(b,nc,1))
             def forward(self,x):
-                e1=self.e1(x);e2=self.e2(self.pool(e1));e3=self.e3(self.pool(e2));e4=self.e4(self.pool(e3))
+                # Inference mode — return only the main output (no aux heads)
+                sz=x.shape[2:]
+                e1=self.e1(x); e2=self.e2(self.pool(e1)); e3=self.e3(self.pool(e2)); e4=self.e4(self.pool(e3))
                 d=self.bn(self.pool(e4))
                 d=self.d4(torch.cat([self.u4(d),e4],1))
                 d=self.d3(torch.cat([self.u3(d),e3],1))
                 d=self.d2(torch.cat([self.u2(d),e2],1))
                 d=self.d1(torch.cat([self.u1(d),e1],1))
-                return self.out(d)
-        _model = ResUNet(b=32,nc=NUM_CLASSES).to(_device)
+                return self.out(d)   # only main head at inference
+
+        _model = ResUNet(b=32, nc=NUM_CLASSES, drop=0.25).to(_device)
+
         if CKPT and CKPT.exists():
-            ckpt=torch.load(str(CKPT),map_location=_device)
-            _model.load_state_dict(ckpt["model_state_dict"],strict=False)
-            print(f"Loaded: epoch={ckpt.get('epoch','?')} dice={ckpt.get('best_dice',0):.4f}")
+            ckpt = torch.load(str(CKPT), map_location=_device)
+            missing, unexpected = _model.load_state_dict(ckpt["model_state_dict"], strict=False)
+            ep   = ckpt.get("epoch", "?")
+            dice = ckpt.get("best_dice", 0.0)
+            print(f"Loaded checkpoint: epoch={ep}, dice={dice:.4f}")
+            if missing:    print(f"  Missing keys  : {len(missing)}  (aux/ds heads not needed at inference)")
+            if unexpected: print(f"  Unexpected keys: {len(unexpected)}")
+        else:
+            print("WARNING: No compatible checkpoint found — model using random weights!")
+            print("  Run training first: python scripts/train_best.py")
+
         _model.eval()
         return _model, _device
 
@@ -132,9 +196,10 @@ def run_pred(file_bytes,filename):
         try:
             import SimpleITK as sitk
             vol=sitk.GetArrayFromImage(sitk.ReadImage(str(tmp))).astype(np.float32)
-            n=vol.shape[0]; lo,hi=int(n*0.2),int(n*0.8)
+            n=vol.shape[0]; lo,hi=int(n*0.15),int(n*0.85)
             step=max(1,(hi-lo)//6); slices=[vol[i] for i in range(lo,hi,step)][:6]
         finally: tmp.unlink(missing_ok=True)
+
     preds=[]
     for sl in slices:
         p1,p99=np.percentile(sl,[0.5,99.5])
@@ -146,9 +211,31 @@ def run_pred(file_bytes,filename):
             pr2=F.softmax(model(torch.flip(t,[-1])),1)
             pr2=torch.flip(pr2,[-1])
             avg=(pr+pr2)/2
-            preds.append((img_r,avg.argmax(1).squeeze(0).cpu().numpy(),avg.squeeze(0).cpu().numpy()))
+
+        # ── Background-bias correction ──────────────────────────────
+        # Models trained with class imbalance often over-predict background.
+        # Fix: suppress background by subtracting a bias so that fg classes
+        # compete fairly. We subtract enough from bg to bring it level with
+        # the strongest foreground class, capped so we don't hallucinate.
+        avg_np = avg.squeeze(0).cpu().numpy()   # [C, H, W]
+        bg_prob  = avg_np[0]                     # background channel
+        fg_probs = avg_np[1:]                    # all foreground channels
+        fg_max   = fg_probs.max(0)               # best fg probability per pixel
+
+        # Only suppress bg where fg has reasonable signal (>1% probability)
+        # Bias = how much bg exceeds the best fg class
+        bg_bias  = np.clip(bg_prob - fg_max - 0.02, 0, None)  # don't over-suppress
+        avg_np[0] = bg_prob - bg_bias            # bring bg down to fg level
+
+        # Re-normalise to sum=1
+        avg_np = avg_np / (avg_np.sum(0, keepdims=True) + 1e-8)
+
+        pred = avg_np.argmax(0).astype(np.int32)
+        preds.append((img_r, pred, avg_np))
+
     mid=len(preds)//2
     img_pre,pred,prob_arr=preds[mid]
+
     cls_dist={}; detected=[]
     for c in range(1,NUM_CLASSES):
         px=int((pred==c).sum())
@@ -156,6 +243,7 @@ def run_pred(file_bytes,filename):
             nm=CLASS_NAMES[c]; pct=round(px/pred.size*100,2)
             cls_dist[nm]={"pixels":px,"percent":pct}
             detected.append(nm)
+
     ivd_p=[float(prob_arr[c].max()) for c in IVD_CLASSES]
     avg_ivd=float(np.mean(ivd_p)) if ivd_p else 0
     if avg_ivd>0.75: disease,severity,conf="Normal","None",round(avg_ivd*100,1)
@@ -163,12 +251,13 @@ def run_pred(file_bytes,filename):
     elif avg_ivd>0.3: disease,severity,conf="Disc Degeneration","Moderate",round(avg_ivd*100,1)
     else: disease,severity,conf="Disc Herniation","Severe",round((1-avg_ivd)*100,1)
     pfirrmann=round(5-avg_ivd*4,1)
-    overlay_img=img_pre.copy()
+
     img_u8=(np.clip(img_pre,0,1)*255).astype(np.uint8)
     img_rgb=cv2.cvtColor(img_u8,cv2.COLOR_GRAY2RGB)
     mask_rgb=colorize(pred)
     fg=(pred>0).astype(np.float32)[...,np.newaxis]
-    blend=(img_rgb*(1-0.55*fg)+mask_rgb*0.55*fg).astype(np.uint8)
+    blend=(img_rgb*(1-0.6*fg)+mask_rgb*0.6*fg).astype(np.uint8)
+
     report=f"LUMBAR SPINE MRI REPORT - ATM-Net++\n{'='*40}\nDiagnosis   : {disease}\nSeverity    : {severity}\nConfidence  : {conf}%\nPfirrmann   : {pfirrmann}/5\n\nDetected Structures:\n"
     for s in detected: report+=f"  * {s}\n"
     report+=f"\nFindings: {disease} with {severity.lower()} severity.\nPfirrmann {pfirrmann}: {'normal.' if pfirrmann<=2 else 'early degeneration.' if pfirrmann<=3 else 'advanced degeneration.'}\n\nWARNING: AI-generated. Requires radiologist review."
@@ -198,7 +287,7 @@ def training():
             try: hist=json.load(open(hf)); break
             except: pass
     ckpts={}
-    for lbl,ck in [("GPU",CKPT_GPU),("CPU",CKPT_CPU)]:
+    for lbl,ck in [("Best",CKPT_BEST),("Last",CKPT_LAST),("CPU",CKPT_CPU)]:
         if ck.exists():
             try:
                 import torch; c=torch.load(str(ck),map_location="cpu")
@@ -214,6 +303,7 @@ def health():
         try:
             c=torch.load(str(CKPT),map_location="cpu")
             info["checkpoint"]=f"epoch {c.get('epoch','?')} | dice={c.get('best_dice',0):.4f}"
+            info["checkpoint_file"]=CKPT.name
         except: pass
     return jsonify(info)
 
