@@ -15,8 +15,20 @@ TARGET_EPOCH = 150
 def get_ckpt_info():
     try:
         import torch
-        c = torch.load(str(CKPT), map_location="cpu")
-        return c.get("epoch", 0), c.get("best_dice", 0.0)
+        from pathlib import Path
+        best_p = Path(r"c:\project\Spine Segmentation\ATM-Net++\outputs\gpu_run\best_model.pth")
+        last_p = Path(r"c:\project\Spine Segmentation\ATM-Net++\outputs\gpu_run\last_model.pth")
+        # Use whichever has a higher epoch
+        best_ep, best_dice = 0, 0.0
+        if best_p.exists():
+            c = torch.load(str(best_p), map_location="cpu")
+            best_ep = c.get("epoch", 0); best_dice = c.get("best_dice", 0.0)
+        last_ep = 0
+        if last_p.exists():
+            c2 = torch.load(str(last_p), map_location="cpu")
+            last_ep = c2.get("epoch", 0)
+        # Report highest epoch seen
+        return max(best_ep, last_ep), best_dice
     except:
         return 0, 0.0
 

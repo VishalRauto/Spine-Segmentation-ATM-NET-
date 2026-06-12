@@ -39,9 +39,9 @@ NUM_CLASSES = 19
 BATCH_SIZE  = 4
 ACCUM_STEPS = 2      # effective BS=8
 EPOCHS      = 200
-LR          = 5e-5
-WEIGHT_DECAY= 5e-4
-MAX_SPP     = 20     # slices per patient for the cache
+LR          = 1e-5   # Reduced: 5e-5 caused oscillation at ep 100+
+WEIGHT_DECAY= 1e-3   # Stronger regularization to reduce overfitting gap
+MAX_SPP     = 20
 PATIENCE    = 50
 SEED        = 42
 
@@ -61,13 +61,13 @@ VERT_CLASSES = list(range(1, 9))
 IVD_CLASSES  = list(range(10, 18))
 RARE_CLASSES = [7, 8, 16, 17]  # Vert-7/8, IVD-7/8
 
-# Expert Fix: Per-class inverse-frequency weights
+# Reverted class weights — 50x was too aggressive, caused oscillation
 CLASS_WEIGHTS = torch.tensor([
     0.0,
-    1.0, 1.0, 1.0, 1.5, 2.0, 3.0, 6.0, 12.0,  # Vert 1-8
-    1.0,                                          # Sacrum
-    6.0, 4.0, 4.0, 5.0, 6.0, 9.0, 14.0, 30.0,  # IVD 1-8
-    0.0,                                          # Canal (absent)
+    1.0, 1.0, 1.0, 1.5, 2.0, 3.0, 6.0, 10.0,   # Vert 1-8
+    1.0,                                            # Sacrum
+    6.0, 4.0, 4.0, 5.0, 6.0, 9.0, 14.0, 30.0,   # IVD 1-8 (IVD-8 = 30x max)
+    0.0,                                            # Canal
 ]).float()
 
 def remap(m):
@@ -111,7 +111,11 @@ def build_cache(pids, split):
             msk_r = cv2.resize(rm.astype(np.float32),(IMG_SIZE,IMG_SIZE),
                                interpolation=cv2.INTER_NEAREST).astype(np.uint8)
             imgs.append(img_r); msks.append(np.clip(msk_r,0,NUM_CLASSES-1))
-            rare_flags.append(1.0 if rare_ratio(rm) > 0.0003 else 0.1)
+            # Mark slices with Vert-8 or IVD-8 as 20x (up from 10x)
+            has_vert8 = float((rm == 8).sum()) / max(rm.size, 1) > 0.0003
+            has_ivd8  = float((rm == 17).sum()) / max(rm.size, 1) > 0.0003
+            has_rare = float(sum((rm == c).sum() for c in [7, 8, 16, 17])) / max(rm.size, 1) > 0.0003
+            rare_flags.append(1.0 if has_rare else 0.1)  # 10x — reverted from 20x
 
     imgs_arr=np.stack(imgs).astype(np.float16)
     msks_arr=np.stack(msks).astype(np.uint8)
@@ -327,12 +331,31 @@ def main():
 
     start_epoch=1; best=0.0
     if CKPT_BEST.exists():
-        ckpt=torch.load(str(CKPT_BEST),map_location=device)
-        missing,_=model.load_state_dict(ckpt["model_state_dict"],strict=False)
-        best=ckpt.get("best_dice",0.0)
-        start_epoch=ckpt.get("epoch",84)+1
-        n_new=len(missing) if missing else 0
-        print(f"\n  Loaded : epoch {ckpt.get('epoch')} | best={best:.4f} | {n_new} new keys (aux)")
+        # Check both best and last checkpoint, resume from whichever has higher epoch
+        last_path = OUT_DIR / "last_model.pth"
+        best_ckpt = torch.load(str(CKPT_BEST), map_location=device)
+        best_ep   = best_ckpt.get("epoch", 0)
+        best_dice_saved = best_ckpt.get("best_dice", 0.0)
+
+        use_last = False
+        if last_path.exists():
+            last_ckpt = torch.load(str(last_path), map_location=device)
+            last_ep   = last_ckpt.get("epoch", 0)
+            if last_ep > best_ep:
+                use_last = True
+                load_ckpt = last_ckpt
+                print(f"\n  Using last_model.pth (ep {last_ep} > best ep {best_ep})")
+            else:
+                load_ckpt = best_ckpt
+
+        if not use_last:
+            load_ckpt = best_ckpt
+
+        missing,_ = model.load_state_dict(load_ckpt["model_state_dict"], strict=False)
+        best        = best_dice_saved  # always track best Dice from best_model.pth
+        start_epoch = load_ckpt.get("epoch", 84) + 1
+        n_new = len(missing) if missing else 0
+        print(f"\n  Loaded : epoch {load_ckpt.get('epoch')} | best={best:.4f} | {n_new} new keys")
         print(f"  Resume : from epoch {start_epoch}\n")
 
     optim=torch.optim.AdamW(model.parameters(),lr=LR,weight_decay=WEIGHT_DECAY)
@@ -387,8 +410,10 @@ def main():
                         "cfg":{"sz":IMG_SIZE,"nc":NUM_CLASSES}},CKPT_BEST)
         else: no_imp+=1
 
-        if ep%10==0:
-            torch.save({"epoch":ep,"model_state_dict":model.state_dict(),"best_dice":best},
+        # Save every 3 epochs regardless (crash recovery)
+        if ep % 3 == 0:
+            torch.save({"epoch":ep,"model_state_dict":model.state_dict(),
+                        "best_dice":best,"cfg":{"sz":IMG_SIZE,"nc":NUM_CLASSES}},
                        OUT_DIR/"last_model.pth")
 
         flag=" ★" if vd==best else ""
