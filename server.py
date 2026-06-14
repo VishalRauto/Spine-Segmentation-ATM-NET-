@@ -1402,6 +1402,7 @@ body{font-family:'Segoe UI',system-ui,sans-serif;background:#0d1117;color:#e2e8f
     <button class="tab-btn" onclick="showTab('about',this)">ℹ️ About</button>
     <button class="tab-btn" onclick="toggleTheme()" id="themeBtn" title="Toggle light/dark">🌙</button>
     <button class="tab-btn" onclick="toggleSettings()" title="Settings">⚙</button>
+    <button class="tab-btn" onclick="document.getElementById('kbdModal').style.display='flex'" title="Keyboard shortcuts">⌨</button>
   </div>
 </nav>
 
@@ -1650,6 +1651,27 @@ body{font-family:'Segoe UI',system-ui,sans-serif;background:#0d1117;color:#e2e8f
       <span>⚡ Model Uncertainty:</span>
       <span id="uncScore" style="color:var(--orange);font-weight:700"></span>
       <span style="color:var(--muted);font-size:11px">(0=certain · 1=uncertain — high values = check manually)</span>
+    </div>
+
+    <!-- Spine health score + ICD-10 row -->
+    <div style="display:grid;grid-template-columns:auto 1fr;gap:12px;margin-top:12px;align-items:start">
+      <div class="card" style="text-align:center;min-width:140px">
+        <h3 style="margin-bottom:10px">🏥 Spine Health Score</h3>
+        <div id="healthScoreRing" style="width:90px;height:90px;border-radius:50%;
+             border:5px solid var(--green);display:flex;align-items:center;justify-content:center;
+             font-size:28px;font-weight:800;color:var(--green);margin:0 auto 8px">—</div>
+        <div id="healthScoreLabel" style="font-size:12px;color:var(--muted)">Run analysis</div>
+        <div style="font-size:10px;color:var(--muted);margin-top:4px">0 = critical · 100 = healthy</div>
+      </div>
+      <div class="card">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+          <h3 style="margin:0">📋 ICD-10 Code Suggestions</h3>
+          <button class="img-btn" onclick="loadICD10()">🔄 Load codes</button>
+        </div>
+        <div id="icdDiv" style="color:var(--muted);font-size:12px">
+          Click "Load codes" after analysis
+        </div>
+      </div>
     </div>
 
     <!-- Detected structures + color legend -->
@@ -1930,6 +1952,17 @@ function showRes(d){
 
   // AI summary
   document.getElementById('aiSummaryText').innerHTML=buildAISummary(d);
+
+  // Spine health score
+  const hs=computeSpineHealthScore(d);
+  const hring=document.getElementById('healthScoreRing');
+  const hlabel=document.getElementById('healthScoreLabel');
+  if(hring){
+    const hcol=hs>=70?'var(--green)':hs>=45?'var(--orange)':'var(--red)';
+    hring.style.borderColor=hcol; hring.style.color=hcol; hring.textContent=hs;
+    hlabel.textContent=hs>=70?'Good spine health':hs>=45?'Moderate — monitor closely':'Poor — clinical review needed';
+    hlabel.style.color=hcol;
+  }
 
   // Store overlay images for toggle
   _overlayData={seg:d.overlay_b64, gcam:d.gradcam_b64, unc:d.uncertainty_b64};
@@ -2676,6 +2709,189 @@ async function deleteHist(id){
   await fetch('/history/'+id,{method:'DELETE'});
   loadHistory();
 }
+
+// ── Patient history full implementation ───────────────────────────────
+let _allHistory = [];
+
+async function loadHistory(){
+  try{
+    const hist = await (await fetch('/history')).json();
+    _allHistory = hist;
+    renderHistory(hist);
+    drawTimeline(hist);
+    renderHistStats(hist);
+  }catch(e){ console.error(e); toast('Failed to load history','error'); }
+}
+
+function filterHistory(q){
+  if(!q.trim()){ renderHistory(_allHistory); return; }
+  const lq = q.toLowerCase();
+  renderHistory(_allHistory.filter(r =>
+    (r.patient?.name||'').toLowerCase().includes(lq) ||
+    (r.disease||'').toLowerCase().includes(lq) ||
+    (r.filename||'').toLowerCase().includes(lq) ||
+    (r.severity||'').toLowerCase().includes(lq)
+  ));
+}
+
+function renderHistory(hist){
+  const el = document.getElementById('histList');
+  if(!hist.length){
+    el.innerHTML='<p style="color:var(--muted);text-align:center;padding:40px">No records found</p>';
+    return;
+  }
+  const sevClass = s=>({None:'sev-none',Mild:'sev-mild',Moderate:'sev-moderate',Severe:'sev-severe'}[s]||'sev-mild');
+  const healthScore = r => {
+    let s=100;
+    s -= (parseFloat(r.pfirrmann||0)-1)*12;
+    if(r.scoliosis_risk?.includes('Mild'))     s-=10;
+    if(r.scoliosis_risk?.includes('Moderate')) s-=25;
+    if(r.scoliosis_risk?.includes('Severe'))   s-=40;
+    if(r.stenosis_risk?.includes('Stenosis'))  s-=20;
+    if(r.severity==='Severe')   s-=20;
+    if(r.severity==='Moderate') s-=10;
+    return Math.max(0,Math.min(100,Math.round(s)));
+  };
+  el.innerHTML = hist.map(r=>{
+    const hs=healthScore(r);
+    const hcol=hs>=70?'var(--green)':hs>=45?'var(--orange)':'var(--red)';
+    return `<div class="hist-item">
+      <div style="flex:0 0 52px;height:52px;border-radius:50%;border:3px solid ${hcol};
+                  display:flex;align-items:center;justify-content:center;
+                  font-size:14px;font-weight:800;color:${hcol}">${hs}</div>
+      <div style="flex:1;min-width:0">
+        <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px;flex-wrap:wrap">
+          <strong style="font-size:14px">${r.patient?.name||r.filename||'Unknown'}</strong>
+          <span class="hist-badge ${sevClass(r.severity)}">${r.severity||'?'}</span>
+          ${r.scoliosis_risk&&r.scoliosis_risk!=='Normal'?`<span class="hist-badge sev-moderate">${r.scoliosis_risk}</span>`:''}
+          ${r.stenosis_risk?.includes('Stenosis')?`<span class="hist-badge sev-severe">Stenosis</span>`:''}
+        </div>
+        <div style="font-size:11px;color:var(--muted);display:flex;gap:12px;flex-wrap:wrap">
+          <span>📅 ${r.timestamp}</span>
+          <span>🔬 ${r.disease}</span>
+          <span>📊 Pfirrmann ${r.pfirrmann}/5</span>
+          ${r.cobb_angle?`<span>📐 ${r.cobb_angle}°</span>`:''}
+          ${r.lordosis_type?`<span>〜 ${r.lordosis_type}</span>`:''}
+          ${r.uncertainty!=null?`<span>⚡ ${parseFloat(r.uncertainty).toFixed(3)}</span>`:''}
+          ${r.patient?.age?`<span>👤 ${r.patient.age}y ${r.patient.sex||''}</span>`:''}
+        </div>
+      </div>
+      <button class="btn btn-danger" style="padding:5px 10px;font-size:11px"
+              onclick="deleteHist2('${r.id}')">🗑</button>
+    </div>`;
+  }).join('');
+}
+
+function renderHistStats(hist){
+  const el=document.getElementById('histStats');
+  if(!hist.length){el.innerHTML='';return;}
+  const total=hist.length;
+  const avgPfi=(hist.reduce((s,r)=>s+parseFloat(r.pfirrmann||0),0)/total).toFixed(1);
+  const scoCount=hist.filter(r=>r.scoliosis_risk&&r.scoliosis_risk!=='Normal').length;
+  const stenCount=hist.filter(r=>r.stenosis_risk?.includes('Stenosis')).length;
+  el.innerHTML=`
+    <div class="stat-card"><div class="stat-val">${total}</div><div class="stat-label">Total Analyses</div></div>
+    <div class="stat-card"><div class="stat-val" style="font-size:18px;color:var(--orange)">${avgPfi}</div><div class="stat-label">Avg Pfirrmann</div></div>
+    <div class="stat-card"><div class="stat-val" style="color:var(--red)">${scoCount}</div><div class="stat-label">Scoliosis Cases</div></div>
+    <div class="stat-card"><div class="stat-val" style="color:var(--red)">${stenCount}</div><div class="stat-label">Stenosis Cases</div></div>`;
+}
+
+function drawTimeline(hist){
+  const empEl=document.getElementById('timelineEmpty');
+  if(!hist.length){if(empEl)empEl.style.display='block';return;}
+  if(empEl)empEl.style.display='none';
+  const cv=document.getElementById('timelineChart');
+  if(!cv)return;
+  const ctx=cv.getContext('2d');
+  cv.width=cv.parentElement.clientWidth-32;cv.height=100;
+  const W=cv.width,H=cv.height,pad={l:36,r:16,t:8,b:22};
+  ctx.clearRect(0,0,W,H);
+  const sorted=hist.slice(0,20).reverse();
+  const pfis=sorted.map(r=>parseFloat(r.pfirrmann||3));
+  if(pfis.length<2)return;
+  const xp=i=>pad.l+(i/(pfis.length-1))*(W-pad.l-pad.r);
+  const yp=v=>H-pad.b-((v-1)/4)*(H-pad.t-pad.b);
+  for(let g=1;g<=5;g++){
+    const y=yp(g);ctx.strokeStyle='#1e2a3a';ctx.lineWidth=1;
+    ctx.setLineDash([3,4]);ctx.beginPath();ctx.moveTo(pad.l,y);ctx.lineTo(W-pad.r,y);ctx.stroke();
+    ctx.setLineDash([]);ctx.fillStyle='#4a5568';ctx.font='8px sans-serif';ctx.fillText('G'+g,2,y+3);
+  }
+  ctx.beginPath();pfis.forEach((v,i)=>i===0?ctx.moveTo(xp(i),yp(v)):ctx.lineTo(xp(i),yp(v)));
+  ctx.lineTo(xp(pfis.length-1),H-pad.b);ctx.lineTo(xp(0),H-pad.b);ctx.closePath();
+  ctx.fillStyle='rgba(246,173,85,.1)';ctx.fill();
+  ctx.strokeStyle='#f6ad55';ctx.lineWidth=2;ctx.beginPath();
+  pfis.forEach((v,i)=>i===0?ctx.moveTo(xp(i),yp(v)):ctx.lineTo(xp(i),yp(v)));ctx.stroke();
+  pfis.forEach((v,i)=>{
+    const col=v<=2?'#68d391':v<=3?'#63b3ed':v<=4?'#f6ad55':'#fc8181';
+    ctx.beginPath();ctx.arc(xp(i),yp(v),3,0,Math.PI*2);ctx.fillStyle=col;ctx.fill();
+  });
+  ctx.fillStyle='#4a5568';ctx.font='8px sans-serif';
+  sorted.forEach((r,i)=>{if(i%(Math.max(1,Math.floor(sorted.length/4)))===0)
+    ctx.fillText((r.timestamp||'').slice(5,10),xp(i)-12,H-4);});
+}
+
+function exportHistCSV(){
+  if(!_allHistory.length){toast('No history to export','warn');return;}
+  const hdr='timestamp,name,age,sex,disease,severity,pfirrmann,cobb_angle,scoliosis,stenosis,lordosis,uncertainty';
+  const rows=_allHistory.map(r=>{
+    const p=r.patient||{};
+    return [r.timestamp||'',p.name||'',p.age||'',p.sex||'',
+      r.disease||'',r.severity||'',r.pfirrmann||'',r.cobb_angle||'',
+      r.scoliosis_risk||'',r.stenosis_risk||'',r.lordosis_type||'',r.uncertainty||'']
+      .map(v=>'"'+String(v).replace(/"/g,'""')+'"').join(',');
+  });
+  const b=new Blob([[hdr,...rows].join('\n')],{type:'text/csv'});
+  const a=document.createElement('a');a.href=URL.createObjectURL(b);
+  a.download='patient_history.csv';a.click();
+  toast('History CSV exported','success');
+}
+
+async function deleteHist2(id){
+  await fetch('/history/'+id,{method:'DELETE'});
+  toast('Record deleted','info');
+  loadHistory();
+}
+
+// ── Spine health score (shown after prediction) ───────────────────────
+function computeSpineHealthScore(d){
+  let score=100;
+  score-=(parseFloat(d.pfirrmann_grade||0)-1)*12;
+  const cv=d.curvature||{};
+  if(cv.risk?.includes('Mild'))     score-=10;
+  if(cv.risk?.includes('Moderate')) score-=25;
+  if(cv.risk?.includes('Severe'))   score-=40;
+  if(d.stenosis?.risk?.includes('Stenosis')) score-=20;
+  if(d.severity==='Severe')   score-=20;
+  if(d.severity==='Moderate') score-=10;
+  const frCount=Object.values(d.fracture_risk||{}).filter(v=>v.risk?.includes('risk')).length;
+  score-=frCount*8;
+  return Math.max(0,Math.min(100,Math.round(score)));
+}
+
+// ── ICD-10 suggestion (shown after prediction) ────────────────────────
+async function loadICD10(){
+  if(!lastData)return;
+  try{
+    const r=await fetch('/icd10',{
+      method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({disease:lastData.disease,severity:lastData.severity,
+        curvature:lastData.curvature,stenosis:lastData.stenosis,
+        fracture_risk:lastData.fracture_risk})
+    });
+    const d=await r.json();
+    const el=document.getElementById('icdDiv');
+    if(!el)return;
+    if(!d.codes?.length){el.innerHTML='<p style="color:var(--muted);font-size:12px">No codes</p>';return;}
+    el.innerHTML=d.codes.map(c=>`
+      <div class="icd-row">
+        <span class="icd-code">${c.code}</span>
+        <span style="color:#cbd5e0;font-size:12px">${c.desc}</span>
+      </div>`).join('');
+    toast('ICD-10 codes loaded','success');
+  }catch(e){console.error(e);}
+}
+
+// placeholder — will be replaced
 </script>
 </body></html>"""
 

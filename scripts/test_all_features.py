@@ -1,21 +1,27 @@
-"""
+﻿"""
 Full feature smoke test — hits every new endpoint and checks responses.
 """
-import requests, json, base64, sys
+import sys, os
+# Fix Windows cp1252 encoding for console output
+sys.stdout.reconfigure(encoding='utf-8') if hasattr(sys.stdout, 'reconfigure') else None
+import requests, json, base64
 from pathlib import Path
 
 BASE = "http://localhost:5000"
 MHA  = Path(r"c:\project\Spine Segmentation\10159290\images\100_t2.mha")
 
-PASS = "\033[92m✓\033[0m"
-FAIL = "\033[91m✗\033[0m"
+PASS = "[PASS]"
+FAIL = "[FAIL]"
 
 results = {}
 
 def check(name, cond, detail=""):
     ok = bool(cond)
     results[name] = ok
-    print(f"  {PASS if ok else FAIL}  {name}" + (f"  →  {detail}" if detail else ""))
+    tag = PASS if ok else FAIL
+    msg = f"  {tag}  {name}"
+    if detail: msg += f"  ->  {detail}"
+    print(msg)
     return ok
 
 print("=" * 55)
@@ -130,14 +136,68 @@ try:
 except Exception as e:
     check("History endpoint", False, str(e))
 
-# ── 5. Training endpoint ──────────────────────────────────────────────
+# ── 5. Training endpoint with new features ───────────────────────────
 print("\n[5] Training monitor")
 try:
     train = requests.get(f"{BASE}/training", timeout=5).json()
-    check("training returns history", isinstance(train.get("history"), list))
-    check("checkpoints returned",     isinstance(train.get("checkpoints"), dict))
+    check("training returns history",   isinstance(train.get("history"), list))
+    check("checkpoints returned",       isinstance(train.get("checkpoints"), dict))
+    check("training history non-empty", len(train.get("history",[])) > 0,
+          f"{len(train.get('history',[]))} epochs")
+    if train.get("history"):
+        h0 = train["history"][0]
+        check("epoch field present",    "ep" in h0 or "epoch" in h0)
+        check("val dice field present", "vd" in h0)
+    check("per_class returned",         isinstance(train.get("per_class"), dict))
 except Exception as e:
     check("Training endpoint", False, str(e))
+
+# ── 6. ICD-10 suggestion ─────────────────────────────────────────────
+print("\n[6] ICD-10 codes")
+try:
+    icd_resp = requests.post(f"{BASE}/icd10",
+                              json={"disease":"Disc Herniation","severity":"Severe",
+                                    "curvature":{"risk":"Mild Scoliosis"},
+                                    "stenosis":{"risk":"Stenosis suspected"},
+                                    "fracture_risk":{}},
+                              timeout=5).json()
+    check("icd10 returns codes",   isinstance(icd_resp.get("codes"), list))
+    check("at least 1 code",       len(icd_resp.get("codes",[])) >= 1)
+    if icd_resp.get("codes"):
+        c0 = icd_resp["codes"][0]
+        check("code has code field", bool(c0.get("code")))
+        check("code has desc field", bool(c0.get("desc")))
+        check("ICD format M##",      c0["code"].startswith("M") or c0["code"].startswith("Z"),
+              c0["code"])
+except Exception as e:
+    check("ICD-10 endpoint", False, str(e))
+
+# ── 7. UI feature checks ──────────────────────────────────────────────
+print("\n[7] UI feature presence")
+try:
+    html = requests.get(f"{BASE}/", timeout=5).text
+    ui_checks = {
+        "toast system"      : "toastContainer" in html,
+        "keyboard shortcuts": "kbdModal" in html,
+        "chart mode toggle" : "setChartMode" in html,
+        "per-class chart"   : "classChart" in html,
+        "timeline chart"    : "timelineChart" in html,
+        "history search"    : "filterHistory" in html,
+        "history stats"     : "histStats" in html,
+        "health score ring" : "healthScoreRing" in html,
+        "ICD panel"         : "icdDiv" in html,
+        "export CSV"        : "exportHistCSV" in html,
+        "training CSV"      : "exportTrainCSV" in html,
+        "split compare"     : "toggleSplit" in html,
+        "heatmap toggle"    : "setOverlay" in html,
+        "settings panel"    : "settingsPanel" in html,
+        "theme toggle"      : "toggleTheme" in html,
+        "keyboard shortcut?": "kbdModal" in html,
+    }
+    for k, v in ui_checks.items():
+        check(k, v)
+except Exception as e:
+    check("UI check", False, str(e))
 
 # ── Summary ───────────────────────────────────────────────────────────
 print("\n" + "=" * 55)
@@ -146,8 +206,8 @@ total  = len(results)
 pct    = round(passed/total*100)
 print(f"  Results: {passed}/{total} passed ({pct}%)")
 if passed == total:
-    print("  ✓ ALL FEATURES WORKING")
+    print("  [ALL FEATURES WORKING]")
 else:
     failed = [k for k,v in results.items() if not v]
-    print(f"  ✗ Failed: {failed}")
+    print(f"  Failed: {failed}")
 print("=" * 55)
