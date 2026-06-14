@@ -1,0 +1,900 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>ATM-Net++ Presentation</title>
+  <style>
+    /* ── Reset & Base ─────────────────────────────────────── */
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg:        #0a0e1a;
+      --surface:   #111827;
+      --border:    #1e2d45;
+      --accent:    #3b82f6;
+      --accent2:   #8b5cf6;
+      --accent3:   #10b981;
+      --accent4:   #f59e0b;
+      --text:      #e2e8f0;
+      --muted:     #94a3b8;
+      --slide-w:   960px;
+      --slide-h:   540px;
+    }
+
+    html, body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+      height: 100%;
+    }
+
+    /* ── Slide Shell ──────────────────────────────────────── */
+    .deck { display: flex; flex-direction: column; align-items: center; gap: 60px; padding: 40px 20px 80px; }
+
+    .slide {
+      width: var(--slide-w);
+      min-height: var(--slide-h);
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      position: relative;
+      overflow: hidden;
+      padding: 48px 56px;
+      display: flex;
+      flex-direction: column;
+      box-shadow: 0 24px 60px rgba(0,0,0,.5);
+    }
+
+    /* slide number badge */
+    .slide::after {
+      content: attr(data-n);
+      position: absolute;
+      bottom: 16px;
+      right: 22px;
+      font-size: 11px;
+      color: var(--muted);
+      opacity: .6;
+    }
+
+    /* accent bar */
+    .slide::before {
+      content: '';
+      position: absolute;
+      top: 0; left: 0; right: 0;
+      height: 4px;
+      background: linear-gradient(90deg, var(--accent), var(--accent2), var(--accent3));
+    }
+
+    /* ── Typography ───────────────────────────────────────── */
+    .label {
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: .12em;
+      text-transform: uppercase;
+      color: var(--accent);
+      margin-bottom: 8px;
+    }
+    h1 { font-size: 42px; font-weight: 800; line-height: 1.15; }
+    h2 { font-size: 28px; font-weight: 700; margin-bottom: 24px; }
+    h3 { font-size: 17px; font-weight: 700; margin-bottom: 6px; }
+    p  { font-size: 15px; line-height: 1.7; color: var(--muted); }
+    li { font-size: 14.5px; line-height: 1.75; color: var(--muted); }
+    ul { padding-left: 18px; }
+    strong { color: var(--text); font-weight: 600; }
+
+    /* subtitle on title slide */
+    .subtitle { font-size: 18px; color: var(--muted); margin-top: 14px; max-width: 600px; }
+
+    /* ── Layout helpers ───────────────────────────────────── */
+    .cols { display: grid; gap: 24px; flex: 1; }
+    .cols-2 { grid-template-columns: 1fr 1fr; }
+    .cols-3 { grid-template-columns: 1fr 1fr 1fr; }
+    .cols-4 { grid-template-columns: 1fr 1fr 1fr 1fr; }
+    .cols-13 { grid-template-columns: 1fr 2fr; }
+    .cols-31 { grid-template-columns: 2fr 1fr; }
+
+    /* ── Cards ────────────────────────────────────────────── */
+    .card {
+      background: rgba(255,255,255,.04);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 20px 22px;
+    }
+    .card.blue   { border-color: rgba(59,130,246,.35); }
+    .card.purple { border-color: rgba(139,92,246,.35); }
+    .card.green  { border-color: rgba(16,185,129,.35); }
+    .card.amber  { border-color: rgba(245,158,11,.35); }
+    .card.red    { border-color: rgba(239,68,68,.35); }
+
+    /* ── Chips / Tags ─────────────────────────────────────── */
+    .chip {
+      display: inline-block;
+      font-size: 11px;
+      font-weight: 600;
+      padding: 3px 9px;
+      border-radius: 20px;
+      margin: 2px;
+    }
+    .chip-blue   { background: rgba(59,130,246,.2);  color: #93c5fd; }
+    .chip-purple { background: rgba(139,92,246,.2);  color: #c4b5fd; }
+    .chip-green  { background: rgba(16,185,129,.2);  color: #6ee7b7; }
+    .chip-amber  { background: rgba(245,158,11,.2);  color: #fcd34d; }
+    .chip-red    { background: rgba(239,68,68,.2);   color: #fca5a5; }
+
+    /* ── Stat boxes ───────────────────────────────────────── */
+    .stat { text-align: center; }
+    .stat .num  { font-size: 36px; font-weight: 800; }
+    .stat .desc { font-size: 12px; color: var(--muted); margin-top: 4px; }
+    .stat.blue .num   { color: #60a5fa; }
+    .stat.green .num  { color: #34d399; }
+    .stat.amber .num  { color: #fbbf24; }
+    .stat.purple .num { color: #a78bfa; }
+    .stat.red .num    { color: #f87171; }
+
+    /* ── Architecture boxes ───────────────────────────────── */
+    .arch-box {
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 10px 14px;
+      font-size: 13px;
+      font-weight: 600;
+      text-align: center;
+    }
+    .arch-arrow { text-align: center; font-size: 20px; color: var(--muted); line-height: 1; }
+
+    /* ── Code block ───────────────────────────────────────── */
+    pre {
+      background: #0d1117;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 14px 18px;
+      font-size: 12px;
+      line-height: 1.6;
+      color: #c9d1d9;
+      overflow: auto;
+      font-family: 'Cascadia Code', 'Fira Code', monospace;
+    }
+    .kw  { color: #ff79c6; }
+    .fn  { color: #50fa7b; }
+    .str { color: #f1fa8c; }
+    .cm  { color: #6272a4; }
+    .num { color: #bd93f9; }
+
+    /* ── Table ────────────────────────────────────────────── */
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    th { background: rgba(59,130,246,.15); color: var(--text); padding: 9px 12px; text-align: left; font-size: 12px; font-weight: 700; letter-spacing: .05em; }
+    td { padding: 8px 12px; border-bottom: 1px solid var(--border); color: var(--muted); }
+    tr:last-child td { border-bottom: none; }
+
+    /* ── Pipeline row ─────────────────────────────────────── */
+    .pipe {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      flex-wrap: wrap;
+      margin-top: 8px;
+    }
+    .pipe-step {
+      background: rgba(59,130,246,.15);
+      border: 1px solid rgba(59,130,246,.3);
+      border-radius: 6px;
+      padding: 6px 12px;
+      font-size: 12px;
+      font-weight: 600;
+      color: #93c5fd;
+      white-space: nowrap;
+    }
+    .pipe-arrow { color: var(--muted); font-size: 14px; }
+
+    /* ── Badge row ────────────────────────────────────────── */
+    .badge-row { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+
+    /* ── Divider ──────────────────────────────────────────── */
+    hr { border: none; border-top: 1px solid var(--border); margin: 18px 0; }
+
+    /* ── Title slide extras ───────────────────────────────── */
+    .glow {
+      background: radial-gradient(ellipse at 30% 50%, rgba(59,130,246,.18) 0%, transparent 65%),
+                  radial-gradient(ellipse at 80% 20%, rgba(139,92,246,.14) 0%, transparent 55%);
+      position: absolute; inset: 0; pointer-events: none;
+    }
+
+    /* Responsive */
+    @media (max-width: 1020px) {
+      :root { --slide-w: 95vw; --slide-h: auto; }
+      .cols-2, .cols-3, .cols-4, .cols-13, .cols-31 { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+<div class="deck">
+
+  <!-- ══════════════════════════════════════════════════════
+       SLIDE 1 — Title
+  ══════════════════════════════════════════════════════ -->
+  <div class="slide" data-n="1 / 14" style="justify-content:center;">
+    <div class="glow"></div>
+    <div class="label">Research Project · v1.0.0</div>
+    <h1>ATM-Net++</h1>
+    <p class="subtitle">
+      Anatomy-Aware Multimodal Lumbar Spine MRI<br>
+      Diagnostic &amp; Segmentation System
+    </p>
+    <hr style="margin-top:32px;margin-bottom:24px;max-width:400px;">
+    <div style="display:flex;gap:10px;flex-wrap:wrap;">
+      <span class="chip chip-blue">MRI Segmentation</span>
+      <span class="chip chip-purple">Disease Classification</span>
+      <span class="chip chip-green">Explainability</span>
+      <span class="chip chip-amber">Clinical PDF Reports</span>
+      <span class="chip chip-red">SPIDER Dataset</span>
+    </div>
+  </div>
+
+  <!-- ══════════════════════════════════════════════════════
+       SLIDE 2 — Problem Statement
+  ══════════════════════════════════════════════════════ -->
+  <div class="slide" data-n="2 / 14">
+    <div class="label">Motivation</div>
+    <h2>The Clinical Problem</h2>
+    <div class="cols cols-2" style="flex:1;">
+      <div>
+        <div class="card blue">
+          <h3>🏥 Manual Interpretation is Slow</h3>
+          <p style="margin-top:8px;">Radiologists manually trace vertebrae, IVDs, and the spinal canal across dozens of MRI slices — a time-consuming, subjective process prone to inter-reader variability.</p>
+        </div>
+        <div class="card amber" style="margin-top:16px;">
+          <h3>📊 Multi-modal Data Underused</h3>
+          <p style="margin-top:8px;">Clinical reports, demographics, and MRI images are rarely fused systematically, leaving valuable diagnostic signal untapped in existing AI solutions.</p>
+        </div>
+      </div>
+      <div>
+        <div class="card green">
+          <h3>🎯 What We Need</h3>
+          <ul style="margin-top:8px;">
+            <li>Pixel-level segmentation of vertebrae &amp; discs</li>
+            <li>Automatic disease detection &amp; severity grading</li>
+            <li>Explainable, trustworthy AI predictions</li>
+            <li>Integration of MRI + text reports + demographics</li>
+            <li>Clinician-ready PDF output</li>
+          </ul>
+        </div>
+        <div class="card purple" style="margin-top:16px;">
+          <h3>💡 ATM-Net++ Solution</h3>
+          <p style="margin-top:8px;">A <strong>production-grade clinical AI platform</strong> that takes MRI + radiology text + patient demographics and returns segmentation maps, disease labels, severity scores, and structured reports — all with Grad-CAM explainability.</p>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ══════════════════════════════════════════════════════
+       SLIDE 3 — Key Numbers
+  ══════════════════════════════════════════════════════ -->
+  <div class="slide" data-n="3 / 14" style="justify-content:center;">
+    <div class="label">At a Glance</div>
+    <h2 style="margin-bottom:36px;">Key Numbers</h2>
+    <div class="cols cols-4">
+      <div class="card blue" style="text-align:center;padding:28px 16px;">
+        <div class="stat blue"><div class="num">&gt;0.90</div><div class="desc">Target Dice Score</div></div>
+      </div>
+      <div class="card green" style="text-align:center;padding:28px 16px;">
+        <div class="stat green"><div class="num">20</div><div class="desc">Segmentation Classes</div></div>
+      </div>
+      <div class="card purple" style="text-align:center;padding:28px 16px;">
+        <div class="stat purple"><div class="num">7</div><div class="desc">Disease Categories</div></div>
+      </div>
+      <div class="card amber" style="text-align:center;padding:28px 16px;">
+        <div class="stat amber"><div class="num">447</div><div class="desc">SPIDER MRI Volumes</div></div>
+      </div>
+    </div>
+    <div class="cols cols-4" style="margin-top:20px;">
+      <div class="card" style="text-align:center;padding:20px 12px;">
+        <div class="stat blue"><div class="num">3</div><div class="desc">Input Modalities</div></div>
+      </div>
+      <div class="card" style="text-align:center;padding:20px 12px;">
+        <div class="stat green"><div class="num">5</div><div class="desc">Micro-services (Docker)</div></div>
+      </div>
+      <div class="card" style="text-align:center;padding:20px 12px;">
+        <div class="stat purple"><div class="num">200</div><div class="desc">Training Epochs</div></div>
+      </div>
+      <div class="card" style="text-align:center;padding:20px 12px;">
+        <div class="stat amber"><div class="num">5-fold</div><div class="desc">Cross-Validation</div></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ══════════════════════════════════════════════════════
+       SLIDE 4 — Dataset
+  ══════════════════════════════════════════════════════ -->
+  <div class="slide" data-n="4 / 14">
+    <div class="label">Data</div>
+    <h2>SPIDER Dataset</h2>
+    <div class="cols cols-13" style="flex:1;align-items:start;">
+      <div>
+        <div class="card blue">
+          <h3>📦 Dataset Overview</h3>
+          <ul style="margin-top:8px;">
+            <li><strong>447 MRI volumes</strong> (T1 &amp; T2 sagittal)</li>
+            <li>Paired <strong>images + masks</strong> in .mha format</li>
+            <li><code>overview.csv</code> — acquisition metadata + sex/subset</li>
+            <li><code>radiological_gradings.csv</code> — per-IVD pathology grades</li>
+          </ul>
+        </div>
+        <div class="card amber" style="margin-top:16px;">
+          <h3>🔀 Split</h3>
+          <ul style="margin-top:8px;">
+            <li><strong>70%</strong> Train &nbsp;·&nbsp; <strong>15%</strong> Validation &nbsp;·&nbsp; <strong>15%</strong> Test</li>
+            <li>5-fold cross-validation strategy</li>
+            <li>Both T1 and T2 modalities used</li>
+            <li>Image resolution: <strong>512 × 512</strong></li>
+          </ul>
+        </div>
+      </div>
+      <div>
+        <table>
+          <thead><tr><th>SPIDER ID</th><th>Structure</th><th>ATM-Net++ ID</th></tr></thead>
+          <tbody>
+            <tr><td>—</td><td>Background</td><td>0</td></tr>
+            <tr><td>—</td><td>T10 → L5 vertebrae</td><td>1–8</td></tr>
+            <tr><td>25</td><td>S1</td><td>9</td></tr>
+            <tr><td>—</td><td>T10/T11 → L3/L4 discs</td><td>10–15</td></tr>
+            <tr><td>122</td><td>L4/L5 disc</td><td>16</td></tr>
+            <tr><td>123</td><td>L5/S1 disc</td><td>17</td></tr>
+            <tr><td>201</td><td>Spinal canal</td><td>18</td></tr>
+            <tr><td>—</td><td>Spinal cord</td><td>19</td></tr>
+          </tbody>
+        </table>
+        <div class="badge-row" style="margin-top:14px;">
+          <span class="chip chip-blue">MHA format</span>
+          <span class="chip chip-green">NIfTI support</span>
+          <span class="chip chip-amber">DICOM support</span>
+          <span class="chip chip-purple">PNG/JPG support</span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ══════════════════════════════════════════════════════
+       SLIDE 5 — System Architecture
+  ══════════════════════════════════════════════════════ -->
+  <div class="slide" data-n="5 / 14">
+    <div class="label">Design</div>
+    <h2>System Architecture</h2>
+    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;flex:1;justify-content:center;">
+
+      <!-- Inputs -->
+      <div style="display:flex;flex-direction:column;gap:8px;">
+        <div class="arch-box" style="border-color:rgba(59,130,246,.5);color:#93c5fd;min-width:130px;">MRI Image<br><small style="color:var(--muted);font-weight:400;">(T1 / T2, 512×512)</small></div>
+        <div class="arch-box" style="border-color:rgba(139,92,246,.5);color:#c4b5fd;min-width:130px;">Radiology Text<br><small style="color:var(--muted);font-weight:400;">(clinical report)</small></div>
+        <div class="arch-box" style="border-color:rgba(245,158,11,.5);color:#fcd34d;min-width:130px;">Demographics<br><small style="color:var(--muted);font-weight:400;">(age, sex, BMI…)</small></div>
+      </div>
+
+      <div class="arch-arrow">→</div>
+
+      <!-- Encoders -->
+      <div style="display:flex;flex-direction:column;gap:8px;">
+        <div class="arch-box" style="border-color:rgba(59,130,246,.5);color:#93c5fd;min-width:140px;">Swin UNETR<br><small style="color:var(--muted);font-weight:400;">768-dim features</small></div>
+        <div class="arch-box" style="border-color:rgba(139,92,246,.5);color:#c4b5fd;min-width:140px;">Bio-ClinicalBERT<br><small style="color:var(--muted);font-weight:400;">CLS 768-dim</small></div>
+        <div class="arch-box" style="border-color:rgba(245,158,11,.5);color:#fcd34d;min-width:140px;">Demographic MLP<br><small style="color:var(--muted);font-weight:400;">256-dim</small></div>
+      </div>
+
+      <div class="arch-arrow">→</div>
+
+      <!-- Fusion -->
+      <div class="arch-box" style="border-color:rgba(16,185,129,.5);color:#6ee7b7;min-width:140px;padding:18px;">
+        Multimodal Fusion<br>
+        <small style="color:var(--muted);font-weight:400;">ATPG · HASF · CCAE<br>Transformer (4 layers, 8h)</small>
+      </div>
+
+      <div class="arch-arrow">→</div>
+
+      <!-- Outputs -->
+      <div style="display:flex;flex-direction:column;gap:8px;">
+        <div class="arch-box" style="border-color:rgba(59,130,246,.5);color:#93c5fd;min-width:120px;">Segmentation<br><small style="color:var(--muted);font-weight:400;">20-class mask</small></div>
+        <div class="arch-box" style="border-color:rgba(239,68,68,.5);color:#fca5a5;min-width:120px;">Disease Class<br><small style="color:var(--muted);font-weight:400;">7 categories</small></div>
+        <div class="arch-box" style="border-color:rgba(245,158,11,.5);color:#fcd34d;min-width:120px;">Severity + Grade<br><small style="color:var(--muted);font-weight:400;">Mild/Mod/Severe</small></div>
+        <div class="arch-box" style="border-color:rgba(16,185,129,.5);color:#6ee7b7;min-width:120px;">PDF Report<br><small style="color:var(--muted);font-weight:400;">+ Grad-CAM</small></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ══════════════════════════════════════════════════════
+       SLIDE 6 — Novel Contributions
+  ══════════════════════════════════════════════════════ -->
+  <div class="slide" data-n="6 / 14">
+    <div class="label">Novel Contributions</div>
+    <h2>What Makes ATM-Net++ New</h2>
+    <div class="cols cols-2" style="flex:1;">
+      <div class="card blue">
+        <h3>① ATPG — Anatomy-Text Prompt Generation</h3>
+        <p style="margin-top:8px;">Generates anatomy-aware text prompts guided by image features. Bridges the visual and language spaces by conditioning BERT token attention on spatial encoder activations.</p>
+        <div class="badge-row"><span class="chip chip-blue">Cross-modal conditioning</span><span class="chip chip-blue">16 learnable prompts</span></div>
+      </div>
+      <div class="card purple">
+        <h3>② HASF — Hierarchical Anatomy-Aware Semantic Fusion</h3>
+        <p style="margin-top:8px;">Fuses image, text and demographic embeddings through multi-head cross-attention at multiple hierarchical scales, preserving both global context and local anatomy.</p>
+        <div class="badge-row"><span class="chip chip-purple">8 attention heads</span><span class="chip chip-purple">4 transformer layers</span></div>
+      </div>
+      <div class="card green">
+        <h3>③ CCAE — Cross-modal Context-Aware Enhancement</h3>
+        <p style="margin-top:8px;">FiLM-style modulation: injects fused multimodal context into decoder feature maps via learned scale and shift parameters, refining segmentation with semantic knowledge.</p>
+        <div class="badge-row"><span class="chip chip-green">FiLM conditioning</span><span class="chip chip-green">Decoder injection</span></div>
+      </div>
+      <div class="card amber">
+        <h3>④ Joint Contrastive Image-Text Alignment</h3>
+        <p style="margin-top:8px;">NT-Xent contrastive loss aligns image and text feature projections in a shared 256-dim embedding space, improving cross-modal grounding without extra labeled pairs.</p>
+        <div class="badge-row"><span class="chip chip-amber">NT-Xent loss</span><span class="chip chip-amber">256-dim shared space</span></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ══════════════════════════════════════════════════════
+       SLIDE 7 — Model Components
+  ══════════════════════════════════════════════════════ -->
+  <div class="slide" data-n="7 / 14">
+    <div class="label">Implementation</div>
+    <h2>Model Components</h2>
+    <div class="cols cols-3" style="flex:1;">
+      <div>
+        <div class="card blue">
+          <h3>🖼 Image Encoder</h3>
+          <ul style="margin-top:8px;">
+            <li><strong>Swin UNETR</strong> backbone</li>
+            <li>Residual blocks + attention gates</li>
+            <li>Deep supervision (3 levels)</li>
+            <li>Feature size: 48 → 768-dim global</li>
+            <li>Lightweight U-Net fallback (no MONAI)</li>
+            <li>Input: (B, 1, 512, 512)</li>
+          </ul>
+        </div>
+      </div>
+      <div>
+        <div class="card purple">
+          <h3>📝 Text Encoder</h3>
+          <ul style="margin-top:8px;">
+            <li><strong>Bio-ClinicalBERT</strong> (Alsentzer 2019)</li>
+            <li>First 6 layers frozen</li>
+            <li>Fine-tuned head</li>
+            <li>CLS embedding: 768-dim</li>
+            <li>Max sequence: 512 tokens</li>
+            <li>Token embeddings for ATPG</li>
+          </ul>
+        </div>
+      </div>
+      <div>
+        <div class="card green">
+          <h3>👤 Demographic Encoder</h3>
+          <ul style="margin-top:8px;">
+            <li>8-dim input vector</li>
+            <li>3-layer MLP: 64→128→256</li>
+            <li>Dropout 0.2</li>
+            <li>Fields: age, sex, BMI,<br>height, weight, symptoms</li>
+            <li>Output: 256-dim</li>
+          </ul>
+        </div>
+      </div>
+      <div>
+        <div class="card amber">
+          <h3>🧩 Multi-Task Heads</h3>
+          <ul style="margin-top:8px;">
+            <li>Disease classification (7-class)</li>
+            <li>Severity: 3-class + regression</li>
+            <li>Level localization: 8 IVDs, multi-label</li>
+            <li>IVD pathology + Pfirrmann grade</li>
+            <li>All conditioned on fused 512-dim</li>
+          </ul>
+        </div>
+      </div>
+      <div>
+        <div class="card red">
+          <h3>📄 Report Generator</h3>
+          <ul style="margin-top:8px;">
+            <li>Neural report head (NeuralReportHead)</li>
+            <li>Template + neural hybrid</li>
+            <li>Findings, impression, recommendation</li>
+            <li>ReportLab PDF rendering</li>
+            <li>Radiologist-style structure</li>
+          </ul>
+        </div>
+      </div>
+      <div>
+        <div class="card" style="border-color:rgba(16,185,129,.35);">
+          <h3>🔍 Explainability</h3>
+          <ul style="margin-top:8px;">
+            <li><strong>Grad-CAM</strong> (Selvaraju 2017)</li>
+            <li>Attention Rollout (Abnar 2020)</li>
+            <li>Segmentation overlay (α=0.4)</li>
+            <li>Disease localization heatmaps</li>
+            <li>Base64 encoding for API</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ══════════════════════════════════════════════════════
+       SLIDE 8 — Training Details
+  ══════════════════════════════════════════════════════ -->
+  <div class="slide" data-n="8 / 14">
+    <div class="label">Training</div>
+    <h2>Training Configuration &amp; Losses</h2>
+    <div class="cols cols-2" style="flex:1;">
+      <div>
+        <div class="card blue">
+          <h3>⚙️ Optimizer &amp; Schedule</h3>
+          <ul style="margin-top:8px;">
+            <li><strong>AdamW</strong> · lr=1e-4 · wd=1e-5 · β=(0.9, 0.999)</li>
+            <li><strong>Cosine LR</strong> + 10-epoch linear warmup</li>
+            <li>Min LR: 1e-6</li>
+            <li>200 epochs · batch size 4 · grad accum ×4</li>
+            <li><strong>Mixed precision</strong> (FP16 AMP)</li>
+            <li>Early stopping · patience=30 on val Dice</li>
+          </ul>
+        </div>
+        <div class="card amber" style="margin-top:16px;">
+          <h3>🔁 Augmentation</h3>
+          <ul style="margin-top:8px;">
+            <li>Random rotation ±15°</li>
+            <li>Horizontal/vertical flip (p=0.5)</li>
+            <li>Elastic deformation (α=100, σ=10)</li>
+            <li>Intensity shift ±0.1, scale ±0.1</li>
+            <li>Gaussian noise σ=0.01</li>
+            <li>Random crop 480×480, zoom 0.9–1.1×</li>
+          </ul>
+        </div>
+      </div>
+      <div>
+        <div class="card green">
+          <h3>📉 Loss Functions</h3>
+          <table style="margin-top:8px;">
+            <thead><tr><th>Component</th><th>Weight</th></tr></thead>
+            <tbody>
+              <tr><td>Segmentation Dice</td><td><strong>1.0</strong></td></tr>
+              <tr><td>Segmentation Focal</td><td><strong>0.5</strong></td></tr>
+              <tr><td>Segmentation Boundary</td><td><strong>0.2</strong></td></tr>
+              <tr><td>Disease Classification (Focal CE)</td><td><strong>0.3</strong></td></tr>
+              <tr><td>Severity Estimation</td><td><strong>0.2</strong></td></tr>
+              <tr><td>Level Localization</td><td><strong>0.2</strong></td></tr>
+              <tr><td>Report Generation</td><td><strong>0.1</strong></td></tr>
+              <tr><td>Contrastive (NT-Xent)</td><td><strong>0.1</strong></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="card purple" style="margin-top:16px;">
+          <h3>🛠 Training Features</h3>
+          <ul style="margin-top:8px;">
+            <li>TensorBoard + W&amp;B logging</li>
+            <li>Auto best-model checkpointing</li>
+            <li>Resume from checkpoint</li>
+            <li>Debug mode (2 epochs, small batch)</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ══════════════════════════════════════════════════════
+       SLIDE 9 — Evaluation Metrics
+  ══════════════════════════════════════════════════════ -->
+  <div class="slide" data-n="9 / 14">
+    <div class="label">Evaluation</div>
+    <h2>Metrics &amp; Evaluation Protocol</h2>
+    <div class="cols cols-13" style="flex:1;align-items:start;">
+      <div>
+        <div class="card blue">
+          <h3>📐 Segmentation Metrics</h3>
+          <ul style="margin-top:8px;">
+            <li><strong>Dice Score</strong> — per-class &amp; mean (target &gt;0.90)</li>
+            <li><strong>Jaccard / IoU</strong> — intersection over union</li>
+            <li><strong>HD95</strong> — 95th percentile Hausdorff Distance</li>
+            <li><strong>ASD</strong> — Average Surface Distance</li>
+            <li><strong>Precision, Recall, F1</strong></li>
+          </ul>
+        </div>
+        <div class="card purple" style="margin-top:16px;">
+          <h3>🏥 Classification Metrics</h3>
+          <ul style="margin-top:8px;">
+            <li>Disease classification <strong>accuracy</strong></li>
+            <li>Macro <strong>F1 score</strong> across 7 classes</li>
+            <li>Per-class AUC</li>
+            <li>Severity estimation MAE + accuracy</li>
+          </ul>
+        </div>
+      </div>
+      <div>
+        <div class="card green">
+          <h3>🔬 Inference Features (TTA)</h3>
+          <ul style="margin-top:8px;">
+            <li><strong>Test-Time Augmentation</strong> (3 flip combinations)</li>
+            <li>Threshold: 0.5 on softmax probabilities</li>
+            <li>Batch size 1 for production inference</li>
+          </ul>
+        </div>
+        <div class="card amber" style="margin-top:16px;">
+          <h3>💾 Outputs Saved</h3>
+          <ul style="margin-top:8px;">
+            <li>Segmentation mask (.npy/.mha)</li>
+            <li>Overlay PNG</li>
+            <li>Grad-CAM heatmap PNG</li>
+            <li>Structured JSON results</li>
+            <li>Clinical PDF report</li>
+          </ul>
+        </div>
+        <div class="card red" style="margin-top:16px;">
+          <h3>🩺 Disease Classes</h3>
+          <div class="badge-row">
+            <span class="chip chip-green">Normal</span>
+            <span class="chip chip-amber">Disc Herniation</span>
+            <span class="chip chip-amber">Disc Bulge</span>
+            <span class="chip chip-red">Spinal Stenosis</span>
+            <span class="chip chip-red">DDD</span>
+            <span class="chip chip-red">Spondylolisthesis</span>
+            <span class="chip chip-red">Compression Fracture</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ══════════════════════════════════════════════════════
+       SLIDE 10 — Backend API
+  ══════════════════════════════════════════════════════ -->
+  <div class="slide" data-n="10 / 14">
+    <div class="label">Backend</div>
+    <h2>FastAPI Backend &amp; Database</h2>
+    <div class="cols cols-2" style="flex:1;align-items:start;">
+      <div>
+        <div class="card blue">
+          <h3>🔌 REST API Endpoints</h3>
+          <table style="margin-top:10px;">
+            <thead><tr><th>Method</th><th>Route</th><th>Purpose</th></tr></thead>
+            <tbody>
+              <tr><td>POST</td><td>/auth/register</td><td>Register user</td></tr>
+              <tr><td>POST</td><td>/auth/login</td><td>JWT token</td></tr>
+              <tr><td>POST</td><td>/predict/upload-mri</td><td>Upload &amp; predict</td></tr>
+              <tr><td>POST</td><td>/predict/segment</td><td>Segmentation only</td></tr>
+              <tr><td>GET</td><td>/patients</td><td>List patients</td></tr>
+              <tr><td>GET</td><td>/reports/download/{id}/pdf</td><td>PDF download</td></tr>
+              <tr><td>GET</td><td>/analytics/summary</td><td>Dashboard stats</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+      <div>
+        <div class="card purple">
+          <h3>🗄 Database Schema (PostgreSQL)</h3>
+          <ul style="margin-top:8px;">
+            <li><strong>Users</strong> — roles: admin, radiologist, clinician, researcher, viewer</li>
+            <li><strong>Patients</strong> — demographics, medical history (JSON)</li>
+            <li><strong>Studies</strong> — MRI metadata, modality, status lifecycle</li>
+            <li><strong>Predictions</strong> — full AI output (seg paths, Dice, disease, severity, levels, Grad-CAM)</li>
+            <li><strong>Reports</strong> — findings, impression, PDF path, review workflow</li>
+            <li><strong>AuditLogs</strong> — HIPAA-style action tracking</li>
+          </ul>
+        </div>
+        <div class="card green" style="margin-top:16px;">
+          <h3>🔐 Security</h3>
+          <ul style="margin-top:8px;">
+            <li>JWT authentication (HS256, 60min expiry)</li>
+            <li>bcrypt password hashing</li>
+            <li>Role-based access control</li>
+            <li>Async SQLAlchemy + asyncpg</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ══════════════════════════════════════════════════════
+       SLIDE 11 — Frontend
+  ══════════════════════════════════════════════════════ -->
+  <div class="slide" data-n="11 / 14">
+    <div class="label">Frontend</div>
+    <h2>Next.js 14 Clinical Dashboard</h2>
+    <div class="cols cols-2" style="flex:1;align-items:start;">
+      <div>
+        <div class="card blue">
+          <h3>📱 Pages &amp; Routes</h3>
+          <table style="margin-top:10px;">
+            <thead><tr><th>Route</th><th>Description</th></tr></thead>
+            <tbody>
+              <tr><td>/auth/login</td><td>JWT login page</td></tr>
+              <tr><td>/dashboard</td><td>Analytics overview &amp; charts</td></tr>
+              <tr><td>/upload</td><td>Drag-drop MRI upload, inline results</td></tr>
+              <tr><td>/patients</td><td>Patient CRUD management</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="card amber" style="margin-top:16px;">
+          <h3>🧰 Tech Stack</h3>
+          <div class="badge-row">
+            <span class="chip chip-blue">Next.js 14</span>
+            <span class="chip chip-blue">TypeScript</span>
+            <span class="chip chip-green">Tailwind CSS</span>
+            <span class="chip chip-purple">Zustand (auth state)</span>
+            <span class="chip chip-amber">App Router</span>
+          </div>
+        </div>
+      </div>
+      <div>
+        <div class="card green">
+          <h3>🔧 Frontend Features</h3>
+          <ul style="margin-top:8px;">
+            <li>Drag-and-drop MRI upload (MHA/NIfTI/DICOM/PNG)</li>
+            <li>Real-time prediction results display</li>
+            <li>Segmentation overlay viewer</li>
+            <li>Grad-CAM heatmap visualization</li>
+            <li>Disease classification confidence bars</li>
+            <li>PDF report download button</li>
+            <li>Analytics charts &amp; summary dashboard</li>
+            <li>Full TypeScript API client (<code>src/lib/api.ts</code>)</li>
+          </ul>
+        </div>
+        <div class="card purple" style="margin-top:16px;">
+          <h3>🌐 API Client</h3>
+          <p style="margin-top:8px;">Type-safe <code>api.ts</code> client covers all endpoints. Zustand <code>authStore</code> manages JWT token lifecycle across sessions.</p>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ══════════════════════════════════════════════════════
+       SLIDE 12 — Deployment
+  ══════════════════════════════════════════════════════ -->
+  <div class="slide" data-n="12 / 14">
+    <div class="label">Deployment</div>
+    <h2>Docker Micro-services Stack</h2>
+    <div class="cols cols-3" style="margin-bottom:20px;">
+      <div class="card blue" style="text-align:center;">
+        <div style="font-size:28px;">🌐</div>
+        <h3>Nginx</h3>
+        <p style="margin-top:6px;">Reverse proxy · Port 80<br>SSL termination</p>
+      </div>
+      <div class="card green" style="text-align:center;">
+        <div style="font-size:28px;">⚛️</div>
+        <h3>Frontend</h3>
+        <p style="margin-top:6px;">Next.js · Port 3000<br>Production build</p>
+      </div>
+      <div class="card purple" style="text-align:center;">
+        <div style="font-size:28px;">⚡</div>
+        <h3>Backend</h3>
+        <p style="margin-top:6px;">FastAPI / Uvicorn · Port 8000<br>4 workers · AMP inference</p>
+      </div>
+      <div class="card amber" style="text-align:center;">
+        <div style="font-size:28px;">🐘</div>
+        <h3>PostgreSQL</h3>
+        <p style="margin-top:6px;">Port 5432<br>Async connection pool 10</p>
+      </div>
+      <div class="card red" style="text-align:center;">
+        <div style="font-size:28px;">🔴</div>
+        <h3>Redis</h3>
+        <p style="margin-top:6px;">Port 6379<br>Cache + Celery task queue</p>
+      </div>
+      <div class="card" style="text-align:center;">
+        <div style="font-size:28px;">📦</div>
+        <h3>ONNX Export</h3>
+        <p style="margin-top:6px;">Optimized inference export<br><code>scripts/export_onnx.py</code></p>
+      </div>
+    </div>
+    <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;">
+      <span class="chip chip-blue">docker-compose up --build</span>
+      <span class="pipe-arrow">·</span>
+      <span class="chip chip-green">Frontend: localhost:3000</span>
+      <span class="chip chip-purple">API: localhost:8000/docs</span>
+      <span class="chip chip-amber">Health: localhost:8000/health</span>
+    </div>
+  </div>
+
+  <!-- ══════════════════════════════════════════════════════
+       SLIDE 13 — Research Foundation
+  ══════════════════════════════════════════════════════ -->
+  <div class="slide" data-n="13 / 14">
+    <div class="label">Research Foundation</div>
+    <h2>Based On &amp; Extends</h2>
+    <div class="cols cols-2" style="flex:1;align-items:start;">
+      <div>
+        <div class="card blue">
+          <h3>📚 Prior Art</h3>
+          <table style="margin-top:10px;">
+            <thead><tr><th>Work</th><th>Used For</th></tr></thead>
+            <tbody>
+              <tr><td><strong>Swin UNETR</strong> (Liu 2021)</td><td>Image backbone</td></tr>
+              <tr><td><strong>Bio-ClinicalBERT</strong> (Alsentzer 2019)</td><td>Text encoder</td></tr>
+              <tr><td><strong>Attention U-Net</strong> (Oktay 2018)</td><td>Attention gates</td></tr>
+              <tr><td><strong>Boundary Loss</strong> (Kervadec 2019)</td><td>Seg. loss</td></tr>
+              <tr><td><strong>Focal Loss</strong> (Lin 2017)</td><td>Class imbalance</td></tr>
+              <tr><td><strong>GradCAM</strong> (Selvaraju 2017)</td><td>Explainability</td></tr>
+              <tr><td><strong>ATM-Net</strong> (base)</td><td>Anatomy-text guidance</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+      <div>
+        <div class="card green">
+          <h3>🔑 Key Python Dependencies</h3>
+          <div class="badge-row">
+            <span class="chip chip-blue">PyTorch 2.3</span>
+            <span class="chip chip-purple">MONAI 1.3</span>
+            <span class="chip chip-green">Transformers 4.40</span>
+            <span class="chip chip-amber">FastAPI 0.111</span>
+            <span class="chip chip-red">SimpleITK 2.3</span>
+            <span class="chip chip-blue">SQLAlchemy 2.0</span>
+            <span class="chip chip-purple">Albumentations 1.4</span>
+            <span class="chip chip-green">ReportLab 4.1</span>
+            <span class="chip chip-amber">OpenCV 4.9</span>
+            <span class="chip chip-red">WandB 0.17</span>
+            <span class="chip chip-blue">TorchMetrics 1.4</span>
+            <span class="chip chip-purple">Celery 5.4</span>
+          </div>
+        </div>
+        <div class="card amber" style="margin-top:16px;">
+          <h3>🖥 Hardware Requirements</h3>
+          <ul style="margin-top:8px;">
+            <li>Python 3.10+ · Node.js 20+</li>
+            <li>8 GB+ RAM (16 GB+ for training)</li>
+            <li>GPU optional for inference, <strong>required for fast training</strong></li>
+            <li>Docker + Docker Compose (full stack)</li>
+          </ul>
+        </div>
+        <div class="card red" style="margin-top:16px;">
+          <h3>⚠️ License</h3>
+          <p style="margin-top:6px;font-size:13px;">Research use only. <strong>Not for clinical deployment</strong> without additional validation and regulatory approval.</p>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ══════════════════════════════════════════════════════
+       SLIDE 14 — Quick Start Summary
+  ══════════════════════════════════════════════════════ -->
+  <div class="slide" data-n="14 / 14">
+    <div class="label">Getting Started</div>
+    <h2>Quick Start</h2>
+    <div class="cols cols-2" style="flex:1;align-items:start;">
+      <div>
+        <p style="margin-bottom:12px;font-size:13px;color:var(--muted);">① Install dependencies</p>
+        <pre><span class="cm"># Python</span>
+pip install -r requirements.txt
+
+<span class="cm"># Frontend</span>
+cd frontend &amp;&amp; npm install &amp;&amp; cd ..</pre>
+
+        <p style="margin:14px 0 10px;font-size:13px;color:var(--muted);">② Configure &amp; set up data</p>
+        <pre>copy .env.example .env
+<span class="cm"># Edit .env: SECRET_KEY, DB settings</span>
+
+python scripts/setup_data.py \
+  --source "C:\project\Spine Segmentation\10159290"</pre>
+      </div>
+      <div>
+        <p style="margin-bottom:12px;font-size:13px;color:var(--muted);">③ Launch full stack</p>
+        <pre>docker-compose up --build
+
+<span class="cm"># Frontend   → http://localhost:3000</span>
+<span class="cm"># API docs   → http://localhost:8000/docs</span>
+<span class="cm"># Health     → http://localhost:8000/health</span></pre>
+
+        <p style="margin:14px 0 10px;font-size:13px;color:var(--muted);">④ Train or run inference</p>
+        <pre><span class="cm"># Train</span>
+python training/train.py \
+  --config configs/base_config.yaml
+
+<span class="cm"># Inference</span>
+python scripts/run_inference.py \
+  --image data/.../100_t2.mha \
+  --checkpoint checkpoints/best.pth \
+  --save-report outputs/report.pdf</pre>
+      </div>
+    </div>
+    <div style="margin-top:20px;display:flex;gap:10px;flex-wrap:wrap;align-items:center;">
+      <span class="chip chip-green">✔ Full Docker stack</span>
+      <span class="chip chip-blue">✔ Interactive API docs</span>
+      <span class="chip chip-purple">✔ W&amp;B + TensorBoard logging</span>
+      <span class="chip chip-amber">✔ ONNX export ready</span>
+      <span class="chip chip-red">✔ pytest unit + integration tests</span>
+    </div>
+  </div>
+
+</div>
+</body>
+</html>

@@ -1,0 +1,390 @@
+[
+  {
+    "filename": "Screenshot 2026-06-13 021245.png",
+    "timestamp": "2026-06-15 00:56",
+    "disease": "Disc Bulge",
+    "severity": "Mild",
+    "pfirrmann": 2.4,
+    "cobb_angle": 4.2,
+    "scoliosis_risk": "Normal",
+    "lordosis_type": "Kyphosis (reversed curve)",
+    "stenosis_risk": "Canal not visible",
+    "uncertainty": 0.0802,
+    "detected": [
+      "Vertebra-1(L5)",
+      "Vertebra-2(L4)",
+      "Vertebra-3(L3)",
+      "Vertebra-4(L2)",
+      "Vertebra-5(L1)",
+      "IVD L4/L5",
+      "IVD L3/L4",
+      "IVD L2/L3"
+    ],
+    "patient": {
+      "name": "",
+      "age": "",
+      "sex": "",
+      "ht": "",
+      "wt": "",
+      "notes": ""
+    },
+    "id": "eb003bb0"
+  },
+  {
+    "filename": "Screenshot 2026-06-13 021245.png",
+    "timestamp": "2026-06-15 00:42",
+    "disease": "Disc Bulge",
+    "severity": "Mild",
+    "pfirrmann": 2.2,
+    "cobb_angle": 10.5,
+    "scoliosis_risk": "Moderate Scoliosis",
+    "lordosis_type": "Kyphosis (reversed curve)",
+    "stenosis_risk": "Canal not visible",
+    "uncertainty": 0.0826,
+    "detected": [
+      "Vertebra-1(L5)",
+      "Vertebra-2(L4)",
+      "Vertebra-3(L3)",
+      "Vertebra-4(L2)",
+      "Vertebra-5(L1)",
+      "Vertebra-6(T12)",
+      "Sacrum",
+      "IVD L4/L5",
+      "IVD L3/L4",
+      "IVD L2/L3",
+      "IVD L1/L2"
+    ],
+    "patient": {
+      "name": "",
+      "age": "",
+      "sex": "",
+      "ht": "",
+      "wt": "",
+      "notes": ""
+    },
+    "id": "f662ea06"
+  },
+  {
+    "filename": "100_t2.mha",
+    "timestamp": "2026-06-15 00:41",
+    "disease": "Disc Herniation",
+    "severity": "Severe",
+    "pfirrmann": 4.6,
+    "cobb_angle": null,
+    "scoliosis_risk": "Insufficient data",
+    "lordosis_type": "Insufficient data",
+    "stenosis_risk": "Canal not visible",
+    "uncertainty": 0.0953,
+    "detected": [
+      "Vertebra-2(L4)",
+      "Vertebra-3(L3)",
+      "Sacrum"
+    ],
+    "patient": {
+      "name": "",
+      "age": "",
+      "sex": "",
+      "ht": "",
+      "wt": "",
+      "notes": ""
+    },
+    "id": "81e9d5a7"
+  },
+  {
+    "filename": "Screenshot 2026-06-13 021245.png",
+    "timestamp": "2026-06-15 00:34",
+    "disease": "Disc Bulge",
+    "severity": "Mild",
+    "pfirrmann": 2.3,
+    "cobb_angle": 10.3,
+    "scoliosis_risk": "Moderate Scoliosis",
+    "lordosis_type": "Kyphosis (reversed curve)",
+    "stenosis_risk": "Canal not visible",
+    "uncertainty": 0.0877,
+    "detected": [
+      "Vertebra-1(L5)",
+      "Vertebra-2(L4)",
+      "Vertebra-3(L3)",
+      "Vertebra-4(L2)",
+      "Vertebra-5(L1)",
+      "Sacrum",
+      "IVD L4/L5",
+      "IVD L3/L4",
+      "IVD L2/L3",
+      "IVD L1/L2"
+    ],
+    "patient": {
+      "name": "",
+      "age": "",
+      "sex": "",
+      "ht": "",
+      "wt": "",
+      "notes": ""
+    },
+    "id": "9ac172d3"
+  },
+  {
+    "filename": "100_t2.mha",
+    "timestamp": "2026-06-15 00:33",
+    "disease": "Disc Herniation",
+    "severity": "Severe",
+    "pfirrmann": 4.6,
+    "cobb_angle": null,
+    "scoliosis_risk": "Insufficient data",
+    "lordosis_type": "Insufficient data",
+    "stenosis_risk": "Canal not visible",
+    "uncertainty": 0.0973,
+    "detected": [
+      "Vertebra-2(L4)",
+      "Vertebra-3(L3)",
+      "Sacrum"
+    ],
+    "patient": {
+      "name": "Test Patient",
+      "age": "55",
+      "sex": "M",
+      "ht": "",
+      "wt": "",
+      "notes": ""
+    },
+    "id": "2160c835"
+  },
+  {
+    "filename": "Screenshot 2026-06-10 132357.png",
+    "timestamp": "2026-06-13 02:15",
+    "disease": "Normal",
+    "severity": "None",
+    "pfirrmann": 1.5,
+    "cobb_angle": 12.3,
+    "scoliosis_risk": "Moderate Scoliosis",
+    "detected": [
+      "Vertebra-1(L5)",
+      "Vertebra-2(L4)",
+      "Vertebra-3(L3)",
+      "Vertebra-4(L2)",
+      "Vertebra-5(L1)",
+      "Vertebra-6(T12)",
+      "Sacrum",
+      "IVD L5/S1",
+      "IVD L4/L5",
+      "IVD L3/L4",
+      "IVD L2/L3",
+      "IVD L1/L2",
+      "IVD T12/L1",
+      "IVD T11/T12"
+    ],
+    "patient": {
+      "name": "",
+      "age": "",
+      "sex": "",
+      "ht": "",
+      "wt": "",
+      "notes": ""
+    },
+    "id": "4581cfc9"
+  },
+  {
+    "filename": "Screenshot 2026-06-13 021245.png",
+    "timestamp": "2026-06-13 02:13",
+    "disease": "Disc Bulge",
+    "severity": "Mild",
+    "pfirrmann": 2.4,
+    "cobb_angle": 4.2,
+    "scoliosis_risk": "Normal",
+    "detected": [
+      "Vertebra-1(L5)",
+      "Vertebra-2(L4)",
+      "Vertebra-3(L3)",
+      "Vertebra-4(L2)",
+      "Vertebra-5(L1)",
+      "IVD L4/L5",
+      "IVD L3/L4",
+      "IVD L2/L3"
+    ],
+    "patient": {
+      "name": "",
+      "age": "",
+      "sex": "",
+      "ht": "",
+      "wt": "",
+      "notes": ""
+    },
+    "id": "e129e27d"
+  },
+  {
+    "filename": "Screenshot (1).png",
+    "timestamp": "2026-06-13 02:12",
+    "disease": "Disc Herniation",
+    "severity": "Severe",
+    "pfirrmann": 4.4,
+    "cobb_angle": 26.9,
+    "scoliosis_risk": "Severe Scoliosis",
+    "detected": [
+      "Vertebra-1(L5)",
+      "Vertebra-2(L4)",
+      "Vertebra-3(L3)",
+      "Sacrum"
+    ],
+    "patient": {
+      "name": "",
+      "age": "",
+      "sex": "",
+      "ht": "",
+      "wt": "",
+      "notes": ""
+    },
+    "id": "cb4b45fe"
+  },
+  {
+    "filename": "Screenshot 2026-06-13 002938.png",
+    "timestamp": "2026-06-13 02:12",
+    "disease": "Disc Herniation",
+    "severity": "Severe",
+    "pfirrmann": 4.7,
+    "cobb_angle": null,
+    "scoliosis_risk": "Insufficient data",
+    "detected": [
+      "Vertebra-3(L3)",
+      "Vertebra-5(L1)"
+    ],
+    "patient": {
+      "name": "",
+      "age": "",
+      "sex": "",
+      "ht": "",
+      "wt": "",
+      "notes": ""
+    },
+    "id": "8f3fa876"
+  },
+  {
+    "filename": "Screenshot 2025-06-25 143230.png",
+    "timestamp": "2026-06-13 02:11",
+    "disease": "Disc Herniation",
+    "severity": "Severe",
+    "pfirrmann": 4.8,
+    "cobb_angle": null,
+    "scoliosis_risk": "Insufficient data",
+    "detected": [],
+    "patient": {
+      "name": "",
+      "age": "",
+      "sex": "",
+      "ht": "",
+      "wt": "",
+      "notes": ""
+    },
+    "id": "e69a7b4d"
+  },
+  {
+    "filename": "Screenshot (1).png",
+    "timestamp": "2026-06-13 02:11",
+    "disease": "Disc Herniation",
+    "severity": "Severe",
+    "pfirrmann": 4.4,
+    "cobb_angle": 26.9,
+    "scoliosis_risk": "Severe Scoliosis",
+    "detected": [
+      "Vertebra-1(L5)",
+      "Vertebra-2(L4)",
+      "Vertebra-3(L3)",
+      "Sacrum"
+    ],
+    "patient": {
+      "name": "",
+      "age": "",
+      "sex": "",
+      "ht": "",
+      "wt": "",
+      "notes": ""
+    },
+    "id": "41a037d1"
+  },
+  {
+    "filename": "Screenshot 2026-06-13 020340.png",
+    "timestamp": "2026-06-13 02:06",
+    "disease": "Disc Bulge",
+    "severity": "Mild",
+    "pfirrmann": 2.6,
+    "cobb_angle": 5.5,
+    "scoliosis_risk": "Mild Scoliosis",
+    "detected": [
+      "Vertebra-1(L5)",
+      "Vertebra-2(L4)",
+      "Vertebra-3(L3)",
+      "Vertebra-4(L2)",
+      "Vertebra-5(L1)",
+      "Vertebra-6(T12)",
+      "IVD L5/S1",
+      "IVD L4/L5",
+      "IVD L3/L4",
+      "IVD L2/L3"
+    ],
+    "patient": {
+      "name": "Vishal Rauto",
+      "age": "22",
+      "sex": "M",
+      "ht": "178",
+      "wt": "109",
+      "notes": "lower back pain "
+    },
+    "id": "eea9255e"
+  },
+  {
+    "filename": "Screenshot 2026-06-10 132357.png",
+    "timestamp": "2026-06-13 01:54",
+    "disease": "Normal",
+    "severity": "None",
+    "pfirrmann": 1.5,
+    "cobb_angle": 12.3,
+    "scoliosis_risk": "Moderate Scoliosis",
+    "detected": [
+      "Vertebra-1(L5)",
+      "Vertebra-2(L4)",
+      "Vertebra-3(L3)",
+      "Vertebra-4(L2)",
+      "Vertebra-5(L1)",
+      "Vertebra-6(T12)",
+      "Sacrum",
+      "IVD L5/S1",
+      "IVD L4/L5",
+      "IVD L3/L4",
+      "IVD L2/L3",
+      "IVD L1/L2",
+      "IVD T12/L1",
+      "IVD T11/T12"
+    ],
+    "patient": {
+      "name": "",
+      "age": "",
+      "sex": "",
+      "ht": "",
+      "wt": "",
+      "notes": ""
+    },
+    "id": "911469da"
+  },
+  {
+    "filename": "100_t2.mha",
+    "timestamp": "2026-06-13 01:53",
+    "disease": "Disc Herniation",
+    "severity": "Severe",
+    "pfirrmann": 4.7,
+    "cobb_angle": null,
+    "scoliosis_risk": "Insufficient data",
+    "detected": [
+      "Vertebra-2(L4)",
+      "Vertebra-3(L3)",
+      "Sacrum"
+    ],
+    "patient": {
+      "name": "",
+      "age": "",
+      "sex": "",
+      "ht": "",
+      "wt": "",
+      "notes": ""
+    },
+    "id": "4129df5e"
+  }
+]

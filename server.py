@@ -10,7 +10,8 @@ BASE       = Path(__file__).parent
 CKPT_BEST  = BASE / "outputs/gpu_run/best_model.pth"
 CKPT_LAST  = BASE / "outputs/gpu_run/last_model.pth"
 CKPT_CPU   = BASE / "outputs/high_perf_run/best_model.pth"
-HIST_GPU   = BASE / "outputs/gpu_run/history.json"
+HIST_GPU   = BASE / "outputs/training_run/history.json"
+HIST_ALT   = BASE / "outputs/gpu_run/history.json"
 HIST_CPU   = BASE / "outputs/high_perf_run/history.json"
 UPLOAD_DIR = BASE / "outputs/uploads"
 HISTORY_DB = BASE / "outputs/patient_history.json"
@@ -1030,9 +1031,11 @@ def index(): return render_template_string(HTML)
 @app.route("/training")
 def training():
     hist = []
-    for hf in [HIST_GPU, HIST_CPU]:
+    for hf in [HIST_GPU, HIST_ALT, HIST_CPU]:
         if hf.exists():
-            try: hist = json.load(open(hf)); break
+            try:
+                data = json.load(open(hf))
+                if data: hist = data; break
             except: pass
     ckpts = {}
     for lbl, ck in [("Best", CKPT_BEST), ("Last", CKPT_LAST), ("CPU", CKPT_CPU)]:
@@ -1042,7 +1045,15 @@ def training():
                 ckpts[lbl] = {"epoch": c.get("epoch","?"),
                               "best_dice": round(c.get("best_dice", 0), 4)}
             except: pass
-    return jsonify({"history": hist[-60:], "checkpoints": ckpts})
+    # Also include per-class dice from best checkpoint
+    per_class = {}
+    if CKPT and CKPT.exists():
+        try:
+            import torch; c = torch.load(str(CKPT), map_location="cpu")
+            pc = c.get("per_class_dice", {})
+            if pc: per_class = {k: round(v,4) for k,v in pc.items()}
+        except: pass
+    return jsonify({"history": hist[-100:], "checkpoints": ckpts, "per_class": per_class})
 
 @app.route("/history")
 def history():
@@ -1053,6 +1064,67 @@ def delete_history(rec_id):
     hist = [r for r in load_history() if r.get("id") != rec_id]
     save_history(hist)
     return jsonify({"ok": True})
+
+@app.route("/history/export_csv")
+def export_history_csv():
+    from flask import Response
+    hist = load_history()
+    if not hist:
+        return jsonify({"error": "No history"}), 400
+    fields = ["id","timestamp","filename","disease","severity","pfirrmann",
+              "cobb_angle","scoliosis_risk","lordosis_type","stenosis_risk",
+              "uncertainty","patient.name","patient.age","patient.sex"]
+    rows = ["timestamp,name,disease,severity,pfirrmann,cobb_angle,scoliosis,stenosis,uncertainty"]
+    for r in hist:
+        pat = r.get("patient", {})
+        rows.append(",".join(str(r.get(f, pat.get(f.replace("patient.",""),"—"))) for f in
+            ["timestamp","","disease","severity","pfirrmann","cobb_angle",
+             "scoliosis_risk","stenosis_risk","uncertainty"]).replace(",,",f",{pat.get('name','—')},"))
+    csv_text = "\n".join(rows)
+    return Response(csv_text, mimetype="text/csv",
+                    headers={"Content-Disposition": "attachment; filename=spine_history.csv"})
+
+@app.route("/icd10", methods=["POST"])
+def icd10_suggest():
+    """Suggest ICD-10 codes based on analysis findings."""
+    data = request.get_json(silent=True) or {}
+    disease  = data.get("disease","")
+    severity = data.get("severity","")
+    curvature= data.get("curvature",{})
+    stenosis = data.get("stenosis",{})
+    fracture = data.get("fracture_risk",{})
+
+    codes = []
+    # Disc disease
+    if "Herniation" in disease:
+        codes.append({"code":"M51.16","desc":"Intervertebral disc degeneration, lumbar region"})
+        codes.append({"code":"M51.17","desc":"Disc herniation with radiculopathy, lumbosacral"})
+        if severity in ("Severe","Moderate"):
+            codes.append({"code":"M51.06","desc":"Disc disorders with myelopathy, lumbar"})
+    elif "Degeneration" in disease:
+        codes.append({"code":"M51.36","desc":"Other intervertebral disc degeneration, lumbar"})
+        codes.append({"code":"M47.816","desc":"Spondylosis without myelopathy, lumbar"})
+    elif "Bulge" in disease:
+        codes.append({"code":"M51.26","desc":"Disc displacement (bulge), lumbar"})
+    else:
+        codes.append({"code":"Z01.89","desc":"Normal spine MRI findings"})
+
+    # Scoliosis
+    risk = curvature.get("risk","")
+    if "Scoliosis" in risk:
+        codes.append({"code":"M41.06","desc":"Adolescent idiopathic scoliosis, lumbar"})
+        if "Severe" in risk:
+            codes.append({"code":"M41.16","desc":"Thoracolumbar scoliosis"})
+
+    # Stenosis
+    if stenosis.get("risk","").lower().find("stenosis") >= 0:
+        codes.append({"code":"M48.06","desc":"Spinal stenosis, lumbar region"})
+
+    # Fracture risk
+    if any(v.get("risk","").lower().find("risk") >= 0 for v in fracture.values()):
+        codes.append({"code":"M80.08XA","desc":"Age-related osteoporosis with vertebral fracture"})
+
+    return jsonify({"codes": codes})
 
 @app.route("/health")
 def health():
@@ -1258,7 +1330,37 @@ body{font-family:'Segoe UI',system-ui,sans-serif;background:#0d1117;color:#e2e8f
 .setting-row select{background:#1a2535;border:1px solid #2d3748;border-radius:6px;
                     padding:3px 8px;color:#e2e8f0;font-size:12px}
 
-/* Print styles */
+/* Toast notifications */
+#toastContainer{position:fixed;bottom:24px;right:24px;z-index:9999;
+                display:flex;flex-direction:column;gap:8px;pointer-events:none}
+.toast{background:#1e2a3a;border:1px solid #2d3748;border-radius:10px;
+       padding:10px 16px;font-size:13px;color:#e2e8f0;min-width:220px;
+       box-shadow:0 4px 20px rgba(0,0,0,.5);
+       animation:slideIn .25s ease;pointer-events:all;display:flex;gap:10px;align-items:center}
+.toast.success{border-color:var(--green)}.toast.error{border-color:var(--red)}
+.toast.info{border-color:var(--blue)}
+@keyframes slideIn{from{transform:translateX(120%);opacity:0}to{transform:translateX(0);opacity:1}}
+@keyframes slideOut{from{opacity:1}to{transform:translateX(120%);opacity:0}}
+
+/* Chart area */
+#chartArea{background:var(--card);border-radius:12px;padding:18px;
+           border:1px solid var(--border);height:fit-content}
+
+/* Keyboard shortcut tooltip */
+.kbd{background:#2d3748;border:1px solid #4a5568;border-radius:4px;
+     padding:1px 5px;font-size:10px;font-family:monospace;color:#a0aec0}
+
+/* Spine health score ring */
+.health-ring{width:80px;height:80px;border-radius:50%;display:flex;
+             align-items:center;justify-content:center;font-size:22px;
+             font-weight:800;border:4px solid}
+
+/* ICD-10 panel */
+.icd-row{display:flex;align-items:center;gap:10px;padding:7px 0;
+         border-bottom:1px solid var(--border);font-size:12px}
+.icd-code{background:#1a2535;border:1px solid var(--blue);border-radius:6px;
+          padding:2px 8px;font-family:monospace;color:var(--blue);font-weight:700;
+          font-size:11px;min-width:70px;text-align:center}
 @media print{
   .nav,.tab-btn,.btn,.img-btn,.toggle-btn,#settingsPanel,
   .slice-strip,.overlay{display:none!important}
@@ -1586,26 +1688,63 @@ body{font-family:'Segoe UI',system-ui,sans-serif;background:#0d1117;color:#e2e8f
 
 <!-- ═══════════════════════════════ TRAINING ══════════════════════════ -->
 <div class="section" id="s-training"><div class="container">
-  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:18px">
+  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:18px;flex-wrap:wrap;gap:8px">
     <div>
       <h2 style="font-size:22px;font-weight:800">Training Monitor</h2>
       <p style="color:var(--muted);font-size:13px;margin-top:3px">ResUNet+CBAM | SPIDER dataset | RTX 3050</p>
     </div>
-    <button class="btn btn-outline" onclick="loadTrain()">🔄 Refresh</button>
+    <div style="display:flex;gap:6px;flex-wrap:wrap">
+      <button class="btn btn-outline" onclick="loadTrain()">🔄 Refresh</button>
+      <button class="btn btn-outline" onclick="exportTrainCSV()" title="Export training log as CSV">📊 Export CSV</button>
+    </div>
   </div>
+
+  <!-- Stat cards -->
   <div class="train-grid">
     <div class="stat-card"><div class="stat-val" id="st-ep">—</div><div class="stat-label">Epochs Done</div></div>
     <div class="stat-card"><div class="stat-val" id="st-bd" style="color:var(--green)">—</div><div class="stat-label">Best Val Dice</div></div>
     <div class="stat-card"><div class="stat-val" id="st-td">—</div><div class="stat-label">Latest Train Dice</div></div>
     <div class="stat-card"><div class="stat-val" id="st-vl">—</div><div class="stat-label">Latest Val Loss</div></div>
   </div>
-  <div id="chartArea">
-    <div style="font-size:11px;font-weight:700;color:var(--muted);margin-bottom:10px;text-transform:uppercase;letter-spacing:.5px">Dice Score Progress</div>
-    <canvas id="dc" height="200"></canvas>
+
+  <!-- Charts side by side -->
+  <div style="display:grid;grid-template-columns:2fr 1fr;gap:12px;margin-bottom:14px">
+    <div id="chartArea">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
+        <div style="font-size:11px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.5px">Dice Score Progress</div>
+        <div style="display:flex;gap:4px">
+          <button class="toggle-btn active" id="chart-dice" onclick="setChartMode('dice',this)">Dice</button>
+          <button class="toggle-btn" id="chart-loss" onclick="setChartMode('loss',this)">Loss</button>
+          <button class="toggle-btn" id="chart-gap"  onclick="setChartMode('gap',this)">Gap</button>
+        </div>
+      </div>
+      <canvas id="dc" height="200"></canvas>
+    </div>
+    <div class="card" style="margin:0">
+      <h3>Per-Class Dice</h3>
+      <canvas id="classChart" height="220"></canvas>
+      <div id="classChartEmpty" style="color:var(--muted);font-size:12px;text-align:center;
+           padding:20px 0">Run training to see per-class scores</div>
+    </div>
+  </div>
+
+  <!-- Checkpoints row -->
+  <div id="ckptRow" style="display:flex;gap:10px;margin-bottom:14px;flex-wrap:wrap"></div>
+
+  <!-- Epoch table with search -->
+  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+    <div style="font-size:11px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.5px">Epoch Log</div>
+    <div style="display:flex;gap:6px;align-items:center">
+      <input id="epochSearch" type="number" placeholder="Jump to epoch" min="1"
+             style="width:110px;background:#1a2535;border:1px solid #2d3748;border-radius:6px;
+                    padding:4px 8px;color:#e2e8f0;font-size:12px;outline:none"
+             oninput="filterEpoch(this.value)">
+      <button class="img-btn" onclick="exportTrainCSV()">⬇ CSV</button>
+    </div>
   </div>
   <div style="overflow-x:auto">
     <table class="epoch-table">
-      <thead><tr><th>Ep</th><th>Train Loss</th><th>Train Dice</th><th>Val Loss</th><th>Val Dice</th><th>Best</th><th>Gap</th></tr></thead>
+      <thead><tr><th>Ep</th><th>Train Loss</th><th>Train Dice</th><th>Val Loss</th><th>Val Dice</th><th>Best</th><th>Gap</th><th>LR</th></tr></thead>
       <tbody id="etbody"></tbody>
     </table>
   </div>
@@ -1613,13 +1752,37 @@ body{font-family:'Segoe UI',system-ui,sans-serif;background:#0d1117;color:#e2e8f
 
 <!-- ═══════════════════════════════ HISTORY ═══════════════════════════ -->
 <div class="section" id="s-history"><div class="container">
-  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:18px">
+  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:18px;flex-wrap:wrap;gap:8px">
     <div>
       <h2 style="font-size:22px;font-weight:800">Patient History</h2>
-      <p style="color:var(--muted);font-size:13px;margin-top:3px">Last 50 analyses stored locally</p>
+      <p style="color:var(--muted);font-size:13px;margin-top:3px">Last 50 analyses — searchable, exportable</p>
     </div>
-    <button class="btn btn-outline" onclick="loadHistory()">🔄 Refresh</button>
+    <div style="display:flex;gap:6px;flex-wrap:wrap">
+      <input id="histSearch" placeholder="🔍 Search name/diagnosis..." type="text"
+             style="background:#1a2535;border:1px solid #2d3748;border-radius:8px;padding:7px 12px;
+                    color:#e2e8f0;font-size:13px;outline:none;width:220px"
+             oninput="filterHistory(this.value)">
+      <button class="btn btn-outline" onclick="loadHistory()">🔄 Refresh</button>
+      <button class="btn btn-outline" onclick="exportHistCSV()">📊 CSV</button>
+    </div>
   </div>
+
+  <!-- Timeline chart -->
+  <div class="card" style="margin-bottom:14px">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
+      <h3 style="margin:0">Pfirrmann Grade Timeline</h3>
+      <span style="font-size:11px;color:var(--muted)">Lower = healthier</span>
+    </div>
+    <canvas id="timelineChart" height="100"></canvas>
+    <div id="timelineEmpty" style="color:var(--muted);font-size:12px;text-align:center;padding:20px 0;display:none">
+      No history yet — run analyses to see timeline
+    </div>
+  </div>
+
+  <!-- Stats row -->
+  <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:14px" id="histStats"></div>
+
+  <!-- List -->
   <div id="histList"><p style="color:var(--muted);text-align:center;padding:40px">No history yet — run an analysis first</p></div>
 </div></div>
 
@@ -1660,6 +1823,31 @@ body{font-family:'Segoe UI',system-ui,sans-serif;background:#0d1117;color:#e2e8f
     </div>
   </div>
 </div></div>
+
+<!-- Toast container -->
+<div id="toastContainer"></div>
+
+<!-- Keyboard shortcut help modal -->
+<div id="kbdModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.8);
+     z-index:9999;align-items:center;justify-content:center" onclick="this.style.display='none'">
+  <div style="background:#161b27;border:1px solid #2d3748;border-radius:16px;
+              padding:24px;min-width:320px;max-width:440px" onclick="event.stopPropagation()">
+    <h3 style="margin-bottom:16px;font-size:16px;font-weight:800">⌨ Keyboard Shortcuts</h3>
+    <div style="display:grid;gap:8px;font-size:13px">
+      <div style="display:flex;justify-content:space-between"><span>Analyze MRI</span><kbd class="kbd">A</kbd></div>
+      <div style="display:flex;justify-content:space-between"><span>Re-analyze</span><kbd class="kbd">R</kbd></div>
+      <div style="display:flex;justify-content:space-between"><span>Copy report</span><kbd class="kbd">C</kbd></div>
+      <div style="display:flex;justify-content:space-between"><span>Print</span><kbd class="kbd">P</kbd></div>
+      <div style="display:flex;justify-content:space-between"><span>Download PDF</span><kbd class="kbd">D</kbd></div>
+      <div style="display:flex;justify-content:space-between"><span>Next slice</span><kbd class="kbd">→</kbd></div>
+      <div style="display:flex;justify-content:space-between"><span>Prev slice</span><kbd class="kbd">←</kbd></div>
+      <div style="display:flex;justify-content:space-between"><span>Toggle CAM/Seg</span><kbd class="kbd">T</kbd></div>
+      <div style="display:flex;justify-content:space-between"><span>Close/Clear</span><kbd class="kbd">Esc</kbd></div>
+      <div style="display:flex;justify-content:space-between"><span>This help</span><kbd class="kbd">?</kbd></div>
+    </div>
+    <button class="btn btn-outline" style="margin-top:16px;width:100%" onclick="document.getElementById('kbdModal').style.display='none'">Close</button>
+  </div>
+</div>
 
 <!-- ═══════════════════════════════ IMAGE ZOOM MODAL ═════════════════ -->
 <div id="zoomModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.9);z-index:9999;
@@ -2211,14 +2399,73 @@ function clearAll(){
   });
 }
 
+// ── Toast notification system ─────────────────────────────────────────
+function toast(msg, type='info', dur=3000){
+  const c=document.getElementById('toastContainer');
+  const t=document.createElement('div');
+  const icons={info:'ℹ️',success:'✅',error:'❌',warn:'⚠️'};
+  t.className=`toast ${type==='warn'?'info':type}`;
+  t.innerHTML=`<span>${icons[type]||'ℹ️'}</span><span>${msg}</span>`;
+  c.appendChild(t);
+  setTimeout(()=>{t.style.animation='slideOut .25s ease forwards';
+    setTimeout(()=>t.remove(),250);},dur);
+}
+
+// ── Keyboard shortcuts ────────────────────────────────────────────────
+let _currentSlice=0;
+document.addEventListener('keydown',e=>{
+  if(e.target.tagName==='INPUT'||e.target.tagName==='TEXTAREA') return;
+  const k=e.key;
+  if(k==='?'){document.getElementById('kbdModal').style.display='flex';return;}
+  if(k==='Escape'){
+    document.getElementById('zoomModal').style.display='none';
+    document.getElementById('kbdModal').style.display='none';
+    return;
+  }
+  if(!lastData) return;
+  if(k==='a'||k==='A'){if(selFile)analyze();}
+  else if(k==='r'||k==='R'){reAnalyze();}
+  else if(k==='c'||k==='C'){copyReport();}
+  else if(k==='p'||k==='P'){printReport();}
+  else if(k==='d'||k==='D'){dlPDF();}
+  else if(k==='t'||k==='T'){
+    const modes=['seg','gcam','unc'];
+    const cur=modes.findIndex(m=>document.getElementById('tog-'+m)?.classList.contains('active'));
+    setOverlay(modes[(cur+1)%3]);
+  }
+  else if(k==='ArrowRight'){
+    const thumbs=document.querySelectorAll('.slice-thumb');
+    if(thumbs.length){
+      _currentSlice=(_currentSlice+1)%thumbs.length;
+      thumbs[_currentSlice].click();
+    }
+  }
+  else if(k==='ArrowLeft'){
+    const thumbs=document.querySelectorAll('.slice-thumb');
+    if(thumbs.length){
+      _currentSlice=(_currentSlice-1+thumbs.length)%thumbs.length;
+      thumbs[_currentSlice].click();
+    }
+  }
+});
+
 // ── Training monitor ──────────────────────────────────────────────────
+let _trainHistory=[], _chartMode='dice';
+function setChartMode(mode, btn){
+  _chartMode=mode;
+  document.querySelectorAll('[id^=chart-]').forEach(b=>b.classList.remove('active'));
+  btn.classList.add('active');
+  drawMainChart(_trainHistory);
+}
+
 async function loadTrain(){
   try{
     const d=await (await fetch('/training')).json();
-    const h=d.history||[];
+    const h=d.history||[]; _trainHistory=h;
     if(!h.length){
       document.getElementById('etbody').innerHTML=
-        '<tr><td colspan="7" style="color:var(--muted);text-align:center;padding:20px">No training history yet</td></tr>';
+        '<tr><td colspan="8" style="color:var(--muted);text-align:center;padding:20px">No training history yet — start training with watchdog.py</td></tr>';
+      toast('No training history found','warn');
       return;
     }
     const last=h[h.length-1];
@@ -2227,66 +2474,168 @@ async function loadTrain(){
     document.getElementById('st-bd').textContent=(best.vd||0).toFixed(4);
     document.getElementById('st-td').textContent=(last.td||0).toFixed(4);
     document.getElementById('st-vl').textContent=(last.vl||0).toFixed(4);
+
+    // Checkpoint cards
+    const ckRow=document.getElementById('ckptRow'); ckRow.innerHTML='';
+    Object.entries(d.checkpoints||{}).forEach(([lbl,ck])=>{
+      ckRow.innerHTML+=`<div class="stat-card" style="text-align:left;min-width:160px">
+        <div style="font-size:10px;color:var(--muted);font-weight:700;text-transform:uppercase;margin-bottom:4px">${lbl} checkpoint</div>
+        <div style="font-size:18px;font-weight:800;color:var(--green)">${ck.best_dice}</div>
+        <div style="font-size:11px;color:var(--muted)">Epoch ${ck.epoch}</div>
+      </div>`;
+    });
+
+    // Per-class bar chart
+    const pc=d.per_class||{};
+    if(Object.keys(pc).length){
+      document.getElementById('classChartEmpty').style.display='none';
+      drawClassChart(pc);
+    }
+
+    // Epoch table
     const tb=document.getElementById('etbody'); tb.innerHTML='';
-    h.slice(-25).reverse().forEach(row=>{
+    h.slice().reverse().forEach(row=>{
       const ep=row.ep||row.epoch||0;
       const ib=parseFloat(row.vd||0)>=(best.vd||0)-0.0001;
-      tb.innerHTML+=`<tr class="${ib?'best':''}">
+      const gap=row.gap!=null?row.gap:(row.td||0)-(row.vd||0);
+      const lr=row.lr?row.lr.toExponential(1):'—';
+      tb.innerHTML+=`<tr class="${ib?'best':''}" data-ep="${ep}">
         <td>${ep}</td>
         <td>${(row.tl||0).toFixed(4)}</td>
         <td>${(row.td||0).toFixed(4)}</td>
         <td>${(row.vl||0).toFixed(4)}</td>
         <td><strong>${(row.vd||0).toFixed(4)}</strong></td>
         <td style="color:var(--green)">${(best.vd||0).toFixed(4)}</td>
-        <td style="color:${(row.gap||row.td-row.vd||0)>0.05?'var(--orange)':'var(--muted)'}">${((row.gap||0)>0?'+':'')}${(row.gap||0).toFixed(3)}</td>
+        <td style="color:${Math.abs(gap)>0.05?'var(--orange)':'var(--muted)'}">${gap>0?'+':''}${gap.toFixed(3)}</td>
+        <td style="color:var(--muted);font-size:11px">${lr}</td>
       </tr>`;
     });
-    drawDice(h);
-  }catch(e){ console.error('Train load failed',e); }
+
+    drawMainChart(h);
+    toast(`Loaded ${h.length} epochs. Best dice: ${(best.vd||0).toFixed(4)}`,'success');
+  }catch(e){ console.error('Train load failed',e); toast('Failed to load training data','error'); }
 }
 
-function drawDice(h){
+function filterEpoch(val){
+  if(!val) return;
+  const rows=document.querySelectorAll('#etbody tr');
+  rows.forEach(r=>{
+    const ep=parseInt(r.dataset.ep||0);
+    r.style.display=(!val||Math.abs(ep-parseInt(val))<=5)?'':'none';
+  });
+}
+
+function drawMainChart(h){
   const cv=document.getElementById('dc');
   const ctx=cv.getContext('2d');
   cv.width=cv.parentElement.clientWidth-36; cv.height=200;
-  const W=cv.width, H=cv.height, pad={l:42,r:20,t:18,b:32};
+  const W=cv.width, H=cv.height, pad={l:44,r:20,t:18,b:32};
   ctx.clearRect(0,0,W,H);
+  if(!h.length) return;
+
   const eps=h.map(r=>r.ep||r.epoch||0);
-  const tvd=h.map(r=>r.td||0), vvd=h.map(r=>r.vd||0);
-  const maxD=Math.max(.01,...tvd,...vvd);
+  let data1,data2,label1,label2,col1,col2;
+  if(_chartMode==='loss'){
+    data1=h.map(r=>r.tl||0); data2=h.map(r=>r.vl||0);
+    label1='Train Loss'; label2='Val Loss'; col1='rgba(99,179,237,.6)'; col2='#fc8181';
+  } else if(_chartMode==='gap'){
+    data1=h.map(r=>(r.gap!=null?r.gap:(r.td||0)-(r.vd||0)));
+    data2=[]; label1='Overfitting Gap'; label2=''; col1='#f6ad55'; col2='';
+  } else {
+    data1=h.map(r=>r.td||0); data2=h.map(r=>r.vd||0);
+    label1='Train Dice'; label2='Val Dice'; col1='rgba(99,179,237,.6)'; col2='#68d391';
+  }
+
+  const all=[...data1,...data2].filter(x=>isFinite(x));
+  const maxD=Math.max(.01,...all); const minD=Math.min(0,...all);
+  const range=maxD-minD||1;
   const minEp=eps[0]||0, maxEp=eps[eps.length-1]||1;
   const xp=e=>pad.l+(e-minEp)/(maxEp-minEp||1)*(W-pad.l-pad.r);
-  const yp=d=>H-pad.b-(d/maxD)*(H-pad.t-pad.b);
-  // Grid lines
-  [0,.25,.5,.75,1].forEach(v=>{
-    const y=yp(v*maxD);
+  const yp=d=>H-pad.b-((d-minD)/range)*(H-pad.t-pad.b);
+
+  // Grid
+  for(let i=0;i<=4;i++){
+    const v=minD+i/4*range; const y=yp(v);
     ctx.strokeStyle='#1e2a3a'; ctx.lineWidth=1;
     ctx.beginPath(); ctx.moveTo(pad.l,y); ctx.lineTo(W-pad.r,y); ctx.stroke();
-    ctx.fillStyle='#4a5568'; ctx.font='10px sans-serif';
-    ctx.fillText((v*maxD).toFixed(2),2,y+3);
-  });
-  // Target line 0.90
-  ctx.strokeStyle='rgba(246,173,85,.4)'; ctx.lineWidth=1; ctx.setLineDash([5,4]);
-  ctx.beginPath(); ctx.moveTo(pad.l,yp(0.9)); ctx.lineTo(W-pad.r,yp(0.9)); ctx.stroke();
-  ctx.setLineDash([]); ctx.fillStyle='#f6ad55'; ctx.font='10px sans-serif';
-  ctx.fillText('Target 0.90',W-90,yp(0.9)-4);
-  // Lines
-  const drawLine=(data,col,dash=[])=>{
-    ctx.strokeStyle=col; ctx.lineWidth=2.5; ctx.setLineDash(dash);
+    ctx.fillStyle='#4a5568'; ctx.font='9px sans-serif';
+    ctx.fillText(v.toFixed(2),2,y+3);
+  }
+
+  // Target line for dice mode
+  if(_chartMode==='dice'){
+    ctx.strokeStyle='rgba(246,173,85,.4)'; ctx.lineWidth=1; ctx.setLineDash([5,4]);
+    ctx.beginPath(); ctx.moveTo(pad.l,yp(0.9)); ctx.lineTo(W-pad.r,yp(0.9)); ctx.stroke();
+    ctx.setLineDash([]); ctx.fillStyle='#f6ad55'; ctx.font='9px sans-serif';
+    ctx.fillText('0.90',W-26,yp(0.9)-3);
+  }
+
+  // Area fill for val dice
+  if(data2.length && _chartMode==='dice'){
+    ctx.beginPath();
+    data2.forEach((d,i)=>i===0?ctx.moveTo(xp(eps[i]),yp(d)):ctx.lineTo(xp(eps[i]),yp(d)));
+    ctx.lineTo(xp(eps[eps.length-1]),yp(minD));
+    ctx.lineTo(xp(eps[0]),yp(minD)); ctx.closePath();
+    ctx.fillStyle='rgba(104,211,145,.08)'; ctx.fill();
+  }
+
+  const drawLine=(data,col)=>{
+    if(!data.length) return;
+    ctx.strokeStyle=col; ctx.lineWidth=2.5; ctx.setLineDash([]);
     ctx.beginPath(); data.forEach((d,i)=>i===0?ctx.moveTo(xp(eps[i]),yp(d)):ctx.lineTo(xp(eps[i]),yp(d))); ctx.stroke();
-    ctx.setLineDash([]);
+    // Last point dot
+    const li=data.length-1;
+    ctx.beginPath(); ctx.arc(xp(eps[li]),yp(data[li]),4,0,Math.PI*2);
+    ctx.fillStyle=col; ctx.fill();
   };
-  drawLine(tvd,'rgba(99,179,237,.6)',[3,3]);
-  drawLine(vvd,'#68d391');
+  drawLine(data1,col1); if(data2.length) drawLine(data2,col2);
+
   // Epoch labels
   const step=Math.max(1,Math.floor(eps.length/8));
-  ctx.fillStyle='#4a5568'; ctx.font='10px sans-serif';
+  ctx.fillStyle='#4a5568'; ctx.font='9px sans-serif';
   eps.forEach((e,i)=>{if(i%step===0)ctx.fillText(e,xp(e)-6,H-8);});
+
   // Legend
-  ctx.fillStyle='rgba(99,179,237,.6)'; ctx.fillRect(pad.l,5,10,3);
-  ctx.fillStyle='#a0aec0'; ctx.font='11px sans-serif'; ctx.fillText('Train',pad.l+14,10);
-  ctx.fillStyle='#68d391'; ctx.fillRect(pad.l+60,5,10,3);
-  ctx.fillText('Val',pad.l+74,10);
+  [[col1,label1],[col2,label2]].filter(([,l])=>l).forEach(([c,l],i)=>{
+    ctx.fillStyle=c; ctx.fillRect(pad.l+i*70,5,10,3);
+    ctx.fillStyle='#a0aec0'; ctx.font='10px sans-serif'; ctx.fillText(l,pad.l+i*70+13,10);
+  });
+}
+
+function drawClassChart(perClass){
+  const cv=document.getElementById('classChart');
+  const ctx=cv.getContext('2d');
+  cv.width=cv.parentElement.clientWidth-32; cv.height=220;
+  const entries=Object.entries(perClass).sort((a,b)=>b[1]-a[1]);
+  const W=cv.width,H=cv.height,pad={l:60,r:10,t:10,b:10};
+  ctx.clearRect(0,0,W,H);
+  const bh=Math.floor((H-pad.t-pad.b)/entries.length)-2;
+  entries.forEach(([name,dice],i)=>{
+    const y=pad.t+i*(bh+2);
+    const bw=Math.max(2,(W-pad.l-pad.r)*Math.min(dice,1));
+    const col=dice>=0.8?'#68d391':dice>=0.6?'#63b3ed':dice>=0.4?'#f6ad55':'#fc8181';
+    ctx.fillStyle='#1a2535'; ctx.fillRect(pad.l,y,W-pad.l-pad.r,bh);
+    ctx.fillStyle=col; ctx.fillRect(pad.l,y,bw,bh);
+    ctx.fillStyle='#a0aec0'; ctx.font='9px sans-serif';
+    const short=name.replace('Vert-','V').replace('IVD-','I').replace('Sacrum','Sac');
+    ctx.fillText(short,2,y+bh/2+3);
+    ctx.fillStyle='#e2e8f0'; ctx.font='9px sans-serif';
+    ctx.fillText(dice.toFixed(2),pad.l+bw+2,y+bh/2+3);
+  });
+}
+
+function exportTrainCSV(){
+  if(!_trainHistory.length){toast('No training data to export','warn');return;}
+  const rows=['epoch,train_loss,train_dice,val_loss,val_dice,gap,lr'];
+  _trainHistory.forEach(r=>{
+    const ep=r.ep||r.epoch||0;
+    const gap=(r.gap!=null?r.gap:(r.td||0)-(r.vd||0)).toFixed(4);
+    rows.push(`${ep},${(r.tl||0).toFixed(6)},${(r.td||0).toFixed(6)},${(r.vl||0).toFixed(6)},${(r.vd||0).toFixed(6)},${gap},${r.lr||''}`);
+  });
+  const b=new Blob([rows.join('\n')],{type:'text/csv'});
+  const a=document.createElement('a'); a.href=URL.createObjectURL(b);
+  a.download='training_log.csv'; a.click();
+  toast('Training CSV exported','success');
 }
 setInterval(()=>{if(document.getElementById('s-training').classList.contains('active'))loadTrain();},60000);
 
