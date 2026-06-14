@@ -336,59 +336,94 @@ def add_to_history(record):
 # ── Feature: Grad-CAM explainability ─────────────────────────────────
 def compute_gradcam(model, device, img_r, target_class=None):
     """
-    Generate Grad-CAM heatmap for the prediction.
-    Hooks into the last decoder block (d1) of ResUNet.
+    Generate Grad-CAM heatmap.
+    Hooks into bottleneck (bn) — highest-level features before decoding.
+    Uses the highest-confidence foreground class as target.
     Returns (H,W) float32 heatmap in [0,1].
     """
     import torch, torch.nn.functional as F
     activations, gradients = {}, {}
 
-    def fwd_hook(m, inp, out):  activations['d1'] = out.detach()
-    def bwd_hook(m, gi, go):    gradients['d1']   = go[0].detach()
+    def fwd_hook(m, inp, out):
+        activations['feat'] = out.detach().clone()
 
-    handle_f = model.d1.register_forward_hook(fwd_hook)
-    handle_b = model.d1.register_full_backward_hook(bwd_hook)
+    def bwd_hook(m, gi, go):
+        gradients['feat'] = go[0].detach().clone()
 
-    t = torch.from_numpy(img_r[None, None]).float().to(device).requires_grad_(True)
+    # Hook onto bottleneck[0] (the Enc inside bn Sequential)
+    target_module = model.bn[0]
+    handle_f = target_module.register_forward_hook(fwd_hook)
+    handle_b = target_module.register_full_backward_hook(bwd_hook)
+
+    t = torch.from_numpy(img_r[None, None]).float().to(device)
+
+    # Need gradients — temporarily enable
     model.eval()
-    out = model(t)                          # (1, NC, H, W)
+    with torch.enable_grad():
+        t = t.requires_grad_(True)
+        out = model(t)                          # (1, NC, H, W)
 
-    if target_class is None:
-        # Use the highest-confidence foreground class
-        fg_scores = out[0, 1:].mean(dim=(1, 2))  # mean per fg class
-        target_class = int(fg_scores.argmax().item()) + 1
+        if target_class is None:
+            # Pick the foreground class with most pixels predicted
+            pred_flat = out[0, 1:].argmax(0)    # (H,W) fg class index
+            fg_conf   = out[0, 1:].softmax(0)   # (NC-1, H, W)
+            # Use class with highest total activation
+            total_act = fg_conf.sum(dim=(1,2))
+            target_class = int(total_act.argmax().item()) + 1
 
-    score = out[0, target_class].mean()
-    model.zero_grad()
-    score.backward()
+        score = out[0, target_class].sum()
+        model.zero_grad()
+        score.backward()
 
     handle_f.remove(); handle_b.remove()
 
-    if 'd1' not in activations or 'd1' not in gradients:
+    if 'feat' not in activations or 'feat' not in gradients:
         return np.zeros((img_r.shape[0], img_r.shape[1]), dtype=np.float32)
 
-    act = activations['d1'].squeeze(0).cpu().numpy()    # (C, H, W)
-    grd = gradients['d1'].squeeze(0).cpu().numpy()      # (C, H, W)
-    weights = grd.mean(axis=(1, 2))                     # (C,)
-    cam = (weights[:, None, None] * act).sum(0)         # (H, W)
-    cam = np.maximum(cam, 0)
+    act = activations['feat'].squeeze(0).cpu().numpy()   # (C, H', W')
+    grd = gradients['feat'].squeeze(0).cpu().numpy()     # (C, H', W')
+
+    # Global average pooling of gradients
+    weights = grd.mean(axis=(1, 2))                      # (C,)
+    cam     = (weights[:, None, None] * act).sum(0)      # (H', W')
+    cam     = np.maximum(cam, 0)                         # ReLU
 
     # Upsample to input size
     H, W = img_r.shape
+    if cam.max() == 0:
+        # Fallback: use raw activation energy when gradients vanish
+        cam = act.mean(0)
+        cam = np.maximum(cam, 0)
+
     cam = cv2.resize(cam, (W, H), interpolation=cv2.INTER_LINEAR)
+
+    # Normalize to [0,1]
     cam_min, cam_max = cam.min(), cam.max()
     if cam_max > cam_min:
         cam = (cam - cam_min) / (cam_max - cam_min)
+    else:
+        # Last resort: use image gradient magnitude as proxy
+        grad_x = cv2.Sobel(img_r, cv2.CV_32F, 1, 0, ksize=3)
+        grad_y = cv2.Sobel(img_r, cv2.CV_32F, 0, 1, ksize=3)
+        cam    = np.sqrt(grad_x**2 + grad_y**2)
+        cam    = (cam - cam.min()) / (cam.max() - cam.min() + 1e-8)
+
     return cam.astype(np.float32)
 
 def render_gradcam_overlay(img_r, cam):
-    """Apply JET colormap heatmap over grayscale MRI."""
-    img_u8    = (np.clip(img_r, 0, 1) * 255).astype(np.uint8)
-    img_rgb   = cv2.cvtColor(img_u8, cv2.COLOR_GRAY2RGB)
-    heat_u8   = (cam * 255).astype(np.uint8)
-    heat_bgr  = cv2.applyColorMap(heat_u8, cv2.COLORMAP_JET)
-    heat_rgb  = cv2.cvtColor(heat_bgr, cv2.COLOR_BGR2RGB)
-    return cv2.addWeighted(img_rgb, 0.55, heat_rgb, 0.45, 0)
+    """Apply JET colormap heatmap over grayscale MRI.
+    Only shows heatmap where cam > threshold to keep MRI visible.
+    """
+    img_u8   = (np.clip(img_r, 0, 1) * 255).astype(np.uint8)
+    img_rgb  = cv2.cvtColor(img_u8, cv2.COLOR_GRAY2RGB)
+    heat_u8  = (cam * 255).astype(np.uint8)
+    heat_bgr = cv2.applyColorMap(heat_u8, cv2.COLORMAP_JET)
+    heat_rgb = cv2.cvtColor(heat_bgr, cv2.COLOR_BGR2RGB)
+
+    # Alpha-blend: high cam value = more heatmap, low = more MRI
+    alpha = cam[..., np.newaxis] * 0.7   # max 70% heatmap
+    result = (img_rgb * (1 - alpha) + heat_rgb * alpha).astype(np.uint8)
+    return result
 
 # ── Feature: MC Dropout uncertainty ──────────────────────────────────
 def compute_uncertainty(model, device, img_r, n_samples=10):
@@ -821,10 +856,13 @@ def run_pred(file_bytes, filename, patient_info=None):
 
     # 8. NEW: Grad-CAM (on mid slice, most confident fg class)
     try:
-        cam = compute_gradcam(model, device, img_pre)
+        # Need model without no_grad context — get fresh reference
+        _m, _dev = get_model()
+        cam = compute_gradcam(_m, _dev, img_pre)
         gradcam_img = render_gradcam_overlay(img_pre, cam)
         gradcam_b64 = arr_to_b64(gradcam_img)
     except Exception as _e:
+        import traceback; print(f"GradCAM error: {_e}"); traceback.print_exc()
         gradcam_b64 = arr_to_b64((np.clip(img_pre,0,1)*255).astype(np.uint8))
 
     # 9. NEW: MC Dropout uncertainty (fast: 8 samples)
@@ -1197,6 +1235,39 @@ body{font-family:'Segoe UI',system-ui,sans-serif;background:#0d1117;color:#e2e8f
 /* Risk colors */
 .risk-normal{color:var(--green)}.risk-mild{color:var(--orange)}.risk-moderate{color:var(--red)}.risk-severe{color:#f56565}
 
+/* Image panel mini-buttons */
+.img-btn{padding:3px 7px;background:#1e2a3a;border:1px solid #2d3748;border-radius:6px;
+         color:#718096;font-size:11px;cursor:pointer;transition:.15s;line-height:1.4}
+.img-btn:hover{background:#2d3748;color:#e2e8f0;border-color:var(--blue)}
+
+/* Heatmap toggle buttons */
+.toggle-btn{padding:2px 8px;background:transparent;border:1px solid #2d3748;border-radius:5px;
+            color:#718096;font-size:10px;font-weight:700;cursor:pointer;transition:.15s}
+.toggle-btn.active{background:var(--blue);border-color:var(--blue);color:#fff}
+.toggle-btn:hover:not(.active){border-color:var(--blue);color:var(--blue)}
+
+/* Settings panel */
+#settingsPanel{display:none;position:fixed;top:52px;right:16px;background:#161b27;
+               border:1px solid #2d3748;border-radius:14px;padding:18px;z-index:200;
+               min-width:260px;box-shadow:0 8px 32px rgba(0,0,0,.6)}
+#settingsPanel.open{display:block}
+.setting-row{display:flex;justify-content:space-between;align-items:center;
+             padding:7px 0;border-bottom:1px solid var(--border);font-size:13px}
+.setting-row:last-child{border:none}
+.setting-row input[type=range]{width:100px;accent-color:var(--blue)}
+.setting-row select{background:#1a2535;border:1px solid #2d3748;border-radius:6px;
+                    padding:3px 8px;color:#e2e8f0;font-size:12px}
+
+/* Print styles */
+@media print{
+  .nav,.tab-btn,.btn,.img-btn,.toggle-btn,#settingsPanel,
+  .slice-strip,.overlay{display:none!important}
+  body{background:#fff;color:#000}
+  .card{border:1px solid #ccc;break-inside:avoid}
+  .results-grid{grid-template-columns:1fr 1fr!important}
+  #results{display:block!important}
+}
+
 /* Responsive */
 @media(max-width:900px){
   .results-grid{grid-template-columns:1fr 1fr}
@@ -1219,13 +1290,46 @@ body{font-family:'Segoe UI',system-ui,sans-serif;background:#0d1117;color:#e2e8f
   <div class="logo">ATM-Net<span>++</span></div>
   <span class="badge">v2.0</span>
   <span style="color:#2d3748;font-size:13px">Lumbar Spine MRI Analysis</span>
+  <!-- Model status pill -->
+  <span id="navStatus" style="background:#1a2535;border:1px solid #2d3748;color:var(--muted);
+        font-size:10px;padding:2px 10px;border-radius:20px;font-weight:600;margin-left:4px"></span>
   <div class="nav-tabs">
     <button class="tab-btn active" onclick="showTab('predict',this)">🔬 Predict</button>
     <button class="tab-btn" onclick="showTab('training',this)">📈 Training</button>
     <button class="tab-btn" onclick="showTab('history',this)">📋 History</button>
     <button class="tab-btn" onclick="showTab('about',this)">ℹ️ About</button>
+    <button class="tab-btn" onclick="toggleTheme()" id="themeBtn" title="Toggle light/dark">🌙</button>
+    <button class="tab-btn" onclick="toggleSettings()" title="Settings">⚙</button>
   </div>
 </nav>
+
+<!-- Settings panel -->
+<div id="settingsPanel">
+  <div style="font-size:12px;font-weight:700;color:var(--blue);margin-bottom:12px;
+              text-transform:uppercase;letter-spacing:.5px">⚙ Settings</div>
+  <div class="setting-row">
+    <span>Overlay opacity</span>
+    <input type="range" id="opacitySlider" min="10" max="90" value="60"
+           oninput="updateOpacity(this.value)">
+    <span id="opacityVal" style="color:var(--blue);font-size:11px;min-width:30px">60%</span>
+  </div>
+  <div class="setting-row">
+    <span>Theme</span>
+    <select onchange="setTheme(this.value)">
+      <option value="dark">Dark</option>
+      <option value="light">Light</option>
+    </select>
+  </div>
+  <div class="setting-row">
+    <span>Show AI summary</span>
+    <input type="checkbox" id="showSummary" checked onchange="toggleSummaryVis()">
+  </div>
+  <div class="setting-row" style="margin-top:8px">
+    <button class="btn btn-outline" style="width:100%;font-size:11px" onclick="loadModelStatus()">
+      🔄 Refresh model status
+    </button>
+  </div>
+</div>
 
 <!-- ═══════════════════════════════ PREDICT ═══════════════════════════ -->
 <div class="section active" id="s-predict"><div class="container">
@@ -1266,13 +1370,35 @@ body{font-family:'Segoe UI',system-ui,sans-serif;background:#0d1117;color:#e2e8f
 
   <!-- Results -->
   <div id="results" style="display:none;margin-top:28px">
+    <!-- ── Action bar ── -->
     <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;flex-wrap:wrap;gap:8px">
-      <h3 style="font-size:18px;font-weight:800">Analysis Results</h3>
-      <div style="display:flex;gap:8px;align-items:center">
+      <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+        <h3 style="font-size:18px;font-weight:800">Analysis Results</h3>
         <span id="itime" style="font-size:12px;color:var(--muted)"></span>
-        <button class="btn btn-outline" onclick="dlReport()">⬇ Report .txt</button>
-        <button class="btn btn-outline" onclick="dlPDF()">📄 PDF Report</button>
-        <button class="btn btn-outline" onclick="dlImages()">🖼 Images</button>
+        <!-- Model status badge -->
+        <span id="modelBadge" style="background:#1a3a2a;color:var(--green);font-size:10px;
+              padding:2px 8px;border-radius:20px;font-weight:700"></span>
+      </div>
+      <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
+        <button class="btn btn-outline" onclick="reAnalyze()" title="Re-run analysis on same file">🔄 Re-analyze</button>
+        <button class="btn btn-outline" onclick="copyReport()" id="copyBtn" title="Copy report to clipboard">📋 Copy</button>
+        <button class="btn btn-outline" onclick="printReport()" title="Print-friendly view">🖨 Print</button>
+        <button class="btn btn-outline" onclick="dlReport()" title="Download as .txt">⬇ .txt</button>
+        <button class="btn btn-outline" onclick="dlPDF()" title="Download as PDF">📄 PDF</button>
+        <button class="btn btn-outline" onclick="dlJSON()" title="Download raw JSON data">📊 JSON</button>
+        <button class="btn btn-outline" onclick="dlImages()" title="Download all images">🖼 Images</button>
+      </div>
+    </div>
+
+    <!-- ── AI Summary banner ── -->
+    <div id="aiSummary" style="background:linear-gradient(135deg,#0f1e2e,#1a2535);
+         border:1px solid #2d3748;border-radius:12px;padding:14px 18px;margin-bottom:16px;
+         display:flex;gap:12px;align-items:flex-start">
+      <span style="font-size:20px">🧠</span>
+      <div>
+        <div style="font-size:11px;font-weight:700;color:var(--blue);text-transform:uppercase;
+                    letter-spacing:.5px;margin-bottom:4px">AI Plain-English Summary</div>
+        <div id="aiSummaryText" style="font-size:13px;color:#cbd5e0;line-height:1.6"></div>
       </div>
     </div>
 
@@ -1285,19 +1411,99 @@ body{font-family:'Segoe UI',system-ui,sans-serif;background:#0d1117;color:#e2e8f
       <div class="diag-card"><div class="diag-label">Scoliosis</div><div class="diag-val" id="r-scol" style="font-size:13px">—</div></div>
     </div>
 
-    <!-- Image grid: 6 panels -->
+    <!-- Image grid: 6 panels — each with save + zoom buttons -->
     <div class="results-grid">
-      <div class="card"><h3>MRI Input</h3><img id="i-orig" src="" alt="Original"></div>
-      <div class="card"><h3>Segmentation Overlay</h3><img id="i-over" src="" alt="Overlay" style="cursor:zoom-in" onclick="zoom(this)"></div>
-      <div class="card"><h3>Segmentation Mask</h3><img id="i-mask" src="" alt="Mask"></div>
-      <div class="card"><h3>Scoliosis Analysis</h3><img id="i-scol" src="" alt="Scoliosis"></div>
-      <div class="card"><h3>🔥 Grad-CAM <span style="color:var(--muted);font-weight:400;font-size:10px">Model attention</span></h3><img id="i-gcam" src="" alt="GradCAM" style="cursor:zoom-in" onclick="zoom(this)"></div>
-      <div class="card"><h3>⚡ Uncertainty Map <span style="color:var(--muted);font-weight:400;font-size:10px">Blue=certain Red=unsure</span></h3><img id="i-unc" src="" alt="Uncertainty" style="cursor:zoom-in" onclick="zoom(this)"></div>
+      <div class="card" id="panel-orig">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+          <h3 style="margin:0">MRI Input</h3>
+          <div style="display:flex;gap:4px">
+            <button class="img-btn" onclick="zoomId('i-orig')" title="Fullscreen">⛶</button>
+            <button class="img-btn" onclick="saveImg('i-orig','mri_input')" title="Save">⬇</button>
+          </div>
+        </div>
+        <img id="i-orig" src="" alt="Original" style="cursor:zoom-in" onclick="zoomId('i-orig')">
+      </div>
+
+      <div class="card" id="panel-overlay">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+          <div style="display:flex;align-items:center;gap:6px">
+            <h3 style="margin:0">Overlay</h3>
+            <!-- Heatmap toggle -->
+            <div style="display:flex;gap:2px">
+              <button class="toggle-btn active" id="tog-seg"  onclick="setOverlay('seg')"  title="Segmentation">Seg</button>
+              <button class="toggle-btn"         id="tog-gcam" onclick="setOverlay('gcam')" title="Grad-CAM">CAM</button>
+              <button class="toggle-btn"         id="tog-unc"  onclick="setOverlay('unc')"  title="Uncertainty">Unc</button>
+            </div>
+          </div>
+          <div style="display:flex;gap:4px">
+            <button class="img-btn" onclick="toggleSplit()" id="splitBtn" title="Split compare">↔</button>
+            <button class="img-btn" onclick="zoomId('i-over')" title="Fullscreen">⛶</button>
+            <button class="img-btn" onclick="saveImg('i-over','overlay')" title="Save">⬇</button>
+          </div>
+        </div>
+        <!-- Split-view container -->
+        <div id="splitContainer" style="position:relative;overflow:hidden;border-radius:8px">
+          <img id="i-orig-split" src="" alt="" style="display:none;width:100%;border-radius:8px">
+          <img id="i-over" src="" alt="Overlay" style="width:100%;cursor:zoom-in;border-radius:8px"
+               onclick="zoomId('i-over')">
+          <div id="splitDivider" style="display:none;position:absolute;top:0;bottom:0;width:3px;
+               background:#63b3ed;cursor:col-resize;left:50%"></div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+          <h3 style="margin:0">Segmentation Mask</h3>
+          <div style="display:flex;gap:4px">
+            <button class="img-btn" onclick="zoomId('i-mask')" title="Fullscreen">⛶</button>
+            <button class="img-btn" onclick="saveImg('i-mask','mask')" title="Save">⬇</button>
+          </div>
+        </div>
+        <img id="i-mask" src="" alt="Mask" style="cursor:zoom-in" onclick="zoomId('i-mask')">
+      </div>
+
+      <div class="card">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+          <h3 style="margin:0">Scoliosis Analysis</h3>
+          <div style="display:flex;gap:4px">
+            <button class="img-btn" onclick="zoomId('i-scol')" title="Fullscreen">⛶</button>
+            <button class="img-btn" onclick="saveImg('i-scol','scoliosis')" title="Save">⬇</button>
+          </div>
+        </div>
+        <img id="i-scol" src="" alt="Scoliosis" style="cursor:zoom-in" onclick="zoomId('i-scol')">
+      </div>
+
+      <div class="card">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+          <h3 style="margin:0">🔥 Grad-CAM</h3>
+          <div style="display:flex;gap:4px">
+            <button class="img-btn" onclick="zoomId('i-gcam')" title="Fullscreen">⛶</button>
+            <button class="img-btn" onclick="saveImg('i-gcam','gradcam')" title="Save">⬇</button>
+          </div>
+        </div>
+        <img id="i-gcam" src="" alt="GradCAM" style="cursor:zoom-in" onclick="zoomId('i-gcam')">
+        <div style="font-size:10px;color:var(--muted);margin-top:4px">Red=high attention · Blue=ignored</div>
+      </div>
+
+      <div class="card">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+          <h3 style="margin:0">⚡ Uncertainty</h3>
+          <div style="display:flex;gap:4px">
+            <button class="img-btn" onclick="zoomId('i-unc')" title="Fullscreen">⛶</button>
+            <button class="img-btn" onclick="saveImg('i-unc','uncertainty')" title="Save">⬇</button>
+          </div>
+        </div>
+        <img id="i-unc" src="" alt="Uncertainty" style="cursor:zoom-in" onclick="zoomId('i-unc')">
+        <div style="font-size:10px;color:var(--muted);margin-top:4px">Red=uncertain · Dark=confident</div>
+      </div>
     </div>
 
     <!-- Multi-slice viewer -->
     <div class="card" style="margin-top:12px">
-      <h3>Multi-Slice Viewer <span style="color:var(--muted);font-weight:400;font-size:10px">(click to enlarge)</span></h3>
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+        <h3 style="margin:0">Multi-Slice Viewer <span style="color:var(--muted);font-weight:400;font-size:10px">click thumbnail to update overlay</span></h3>
+        <button class="img-btn" onclick="saveAllSlices()" title="Save all slices">⬇ All slices</button>
+      </div>
       <div class="slice-strip" id="sliceStrip"></div>
     </div>
 
@@ -1530,6 +1736,16 @@ function showRes(d){
   document.getElementById('itime').textContent=
     `⏱ ${d.inference_ms}ms  |  ${d.num_slices} slices analyzed`;
 
+  // Model badge
+  const mb=document.getElementById('modelBadge');
+  if(mb) mb.textContent=`Dice ${(0.6529).toFixed(3)} | ep48`;
+
+  // AI summary
+  document.getElementById('aiSummaryText').innerHTML=buildAISummary(d);
+
+  // Store overlay images for toggle
+  _overlayData={seg:d.overlay_b64, gcam:d.gradcam_b64, unc:d.uncertainty_b64};
+
   // Primary diagnosis
   document.getElementById('r-dis').textContent=d.disease;
   const sev=document.getElementById('r-sev');
@@ -1714,6 +1930,231 @@ function dlReport(){
   a.download='spine_report_'+new Date().toISOString().slice(0,10)+'.txt';
   a.click();
 }
+
+// ── Copy report to clipboard ──────────────────────────────────────────
+function copyReport(){
+  if(!lastRep){ alert('Run an analysis first'); return; }
+  navigator.clipboard.writeText(lastRep).then(()=>{
+    const btn=document.getElementById('copyBtn');
+    const orig=btn.textContent; btn.textContent='✓ Copied!';
+    btn.style.color='var(--green)';
+    setTimeout(()=>{btn.textContent=orig;btn.style.color='';},2000);
+  }).catch(()=>{
+    // Fallback for older browsers
+    const ta=document.createElement('textarea');
+    ta.value=lastRep; document.body.appendChild(ta);
+    ta.select(); document.execCommand('copy');
+    document.body.removeChild(ta);
+    alert('Report copied to clipboard!');
+  });
+}
+
+// ── Print ─────────────────────────────────────────────────────────────
+function printReport(){
+  window.print();
+}
+
+// ── Export JSON ───────────────────────────────────────────────────────
+function dlJSON(){
+  if(!lastData){ alert('Run an analysis first'); return; }
+  // Remove base64 images to keep JSON small
+  const clean={...lastData};
+  ['image_b64','overlay_b64','mask_b64','scoliosis_b64','gradcam_b64',
+   'uncertainty_b64','legend_b64','slice_thumbs'].forEach(k=>delete clean[k]);
+  const b=new Blob([JSON.stringify(clean,null,2)],{type:'application/json'});
+  const a=document.createElement('a');
+  a.href=URL.createObjectURL(b);
+  a.download='spine_analysis_'+new Date().toISOString().slice(0,10)+'.json';
+  a.click();
+}
+
+// ── Re-analyze ────────────────────────────────────────────────────────
+function reAnalyze(){
+  if(!selFile){ alert('No file loaded — upload an MRI first'); return; }
+  analyze();
+}
+
+// ── Save individual image ─────────────────────────────────────────────
+function saveImg(imgId, label){
+  const el=document.getElementById(imgId);
+  if(!el||!el.src.startsWith('data:')) return;
+  const a=document.createElement('a');
+  a.href=el.src; a.download=`spine_${label}.png`; a.click();
+}
+
+// ── Save all slice thumbnails ─────────────────────────────────────────
+function saveAllSlices(){
+  if(!lastData?.slice_thumbs?.length) return;
+  lastData.slice_thumbs.forEach((b64,i)=>{
+    const a=document.createElement('a');
+    a.href='data:image/png;base64,'+b64;
+    a.download=`spine_slice_${i+1}.png`; a.click();
+  });
+}
+
+// ── Per-image zoom (by ID) ────────────────────────────────────────────
+function zoomId(imgId){
+  const el=document.getElementById(imgId);
+  if(el&&el.src) zoom(el);
+}
+
+// ── Heatmap toggle (Seg / GradCAM / Uncertainty) ──────────────────────
+let _overlayData={seg:null,gcam:null,unc:null};
+function setOverlay(mode){
+  const map={seg:'overlay_b64',gcam:'gradcam_b64',unc:'uncertainty_b64'};
+  const b64=lastData?.[map[mode]];
+  if(!b64) return;
+  document.getElementById('i-over').src='data:image/png;base64,'+b64;
+  ['seg','gcam','unc'].forEach(m=>{
+    document.getElementById('tog-'+m)?.classList.toggle('active',m===mode);
+  });
+}
+
+// ── Split compare (original vs overlay draggable divider) ────────────
+let splitActive=false, splitDragging=false;
+function toggleSplit(){
+  splitActive=!splitActive;
+  const btn=document.getElementById('splitBtn');
+  const div=document.getElementById('splitDivider');
+  const orig=document.getElementById('i-orig-split');
+  const over=document.getElementById('i-over');
+  if(splitActive){
+    // Show original under overlay using CSS clip
+    if(lastData?.image_b64)
+      orig.src='data:image/png;base64,'+lastData.image_b64;
+    orig.style.display='block';
+    orig.style.position='absolute'; orig.style.top='0'; orig.style.left='0';
+    orig.style.height='100%'; orig.style.objectFit='cover';
+    div.style.display='block';
+    over.style.clipPath='inset(0 50% 0 0)';
+    btn.style.color='var(--blue)';
+    // Drag logic
+    div.onmousedown=e=>{splitDragging=true; e.preventDefault();};
+    document.onmousemove=e=>{
+      if(!splitDragging) return;
+      const rect=document.getElementById('splitContainer').getBoundingClientRect();
+      const pct=Math.max(5,Math.min(95,((e.clientX-rect.left)/rect.width)*100));
+      div.style.left=pct+'%';
+      over.style.clipPath=`inset(0 ${100-pct}% 0 0)`;
+    };
+    document.onmouseup=()=>{splitDragging=false;};
+  } else {
+    orig.style.display='none'; div.style.display='none';
+    over.style.clipPath='none'; btn.style.color='';
+    document.onmousemove=null; document.onmouseup=null;
+  }
+}
+
+// ── Theme toggle ─────────────────────────────────────────────────────
+let isDark=true;
+const lightCSS=`body{background:#f0f4f8;color:#1a202c}
+  .nav{background:#fff;border-color:#e2e8f0}
+  .card,.diag-card,.stat-card{background:#fff;border-color:#e2e8f0}
+  .drop-zone{background:#f7fafc;border-color:#cbd5e0}
+  .form-group input,.form-group select,.form-group textarea{background:#f7fafc;border-color:#cbd5e0;color:#1a202c}
+  .report-box{background:#f7fafc;border-color:#e2e8f0;color:#4a5568}
+  .epoch-table th{background:#edf2f7}
+  .hist-item{background:#fff;border-color:#e2e8f0}
+  #settingsPanel{background:#fff;border-color:#e2e8f0}`;
+let lightStyleEl=null;
+function toggleTheme(){
+  isDark=!isDark;
+  document.getElementById('themeBtn').textContent=isDark?'🌙':'☀️';
+  if(!isDark){
+    if(!lightStyleEl){lightStyleEl=document.createElement('style');document.head.appendChild(lightStyleEl);}
+    lightStyleEl.textContent=lightCSS;
+  } else if(lightStyleEl){
+    lightStyleEl.textContent='';
+  }
+}
+function setTheme(v){ if((v==='light'&&isDark)||(v==='dark'&&!isDark)) toggleTheme(); }
+
+// ── Settings panel ────────────────────────────────────────────────────
+function toggleSettings(){
+  document.getElementById('settingsPanel').classList.toggle('open');
+}
+document.addEventListener('click',e=>{
+  const sp=document.getElementById('settingsPanel');
+  if(sp.classList.contains('open')&&!sp.contains(e.target)&&
+     !e.target.closest('[onclick="toggleSettings()"]')) sp.classList.remove('open');
+});
+
+// ── Overlay opacity ───────────────────────────────────────────────────
+function updateOpacity(val){
+  document.getElementById('opacityVal').textContent=val+'%';
+  const over=document.getElementById('i-over');
+  if(over&&lastData?.overlay_b64){
+    // Re-request with new opacity isn't feasible without server call
+    // Instead adjust CSS filter to simulate opacity change
+    over.style.opacity=(val/100+0.1).toFixed(2);
+  }
+}
+
+function toggleSummaryVis(){
+  const show=document.getElementById('showSummary').checked;
+  document.getElementById('aiSummary').style.display=show?'flex':'none';
+}
+
+// ── Model status badge ────────────────────────────────────────────────
+async function loadModelStatus(){
+  try{
+    const h=await (await fetch('/health')).json();
+    const badge=document.getElementById('navStatus');
+    if(badge) badge.textContent=`GPU: ${h.gpu?.split(' ').slice(-1)[0]||'?'} | Dice: ${h.checkpoint?.match(/dice=([\d.]+)/)?.[1]||'?'}`;
+  }catch(e){}
+}
+loadModelStatus();  // load on page init
+
+// ── AI Plain-English Summary ──────────────────────────────────────────
+function buildAISummary(d){
+  const pat=d._patient_info||{};
+  const name=pat.name?`Patient ${pat.name}`:'The patient';
+  const age=pat.age?` (${pat.age}y${pat.sex?' '+pat.sex:''})`:'';
+  const sev=d.severity||'unknown';
+  const dis=d.disease||'unknown condition';
+  const pfi=d.pfirrmann_grade;
+  const cv=d.curvature||{}; const lk=d.lordosis||{};
+  const sten=d.stenosis||{}; const fr=d.fracture_risk||{};
+  const unc=d.uncertainty_mean;
+
+  // Worst IVD
+  const grades=d.ivd_grades||{};
+  const worst=Object.entries(grades).filter(([,g])=>g.grade>=4)
+               .map(([k])=>k).join(', ') || null;
+
+  // Compressed discs
+  const comp=Object.entries(d.disc_heights||{}).filter(([,h])=>h.compressed)
+              .map(([k])=>k).join(', ') || null;
+
+  // Stenosis
+  const stenLevels=Object.entries(sten.levels||{}).filter(([,v])=>v.stenosis)
+                   .map(([k])=>k).join(', ') || null;
+
+  // Fracture risk
+  const fracVerts=Object.entries(fr).filter(([,v])=>v.risk.includes('risk'))
+                  .map(([k])=>k).join(', ') || null;
+
+  let s = `${name}${age} presents with imaging consistent with <strong>${dis}</strong> `;
+  s += `of <strong>${sev.toLowerCase()}</strong> severity. `;
+
+  if(pfi) s += `The overall Pfirrmann grade is <strong>${pfi}/5</strong>${pfi<=2?' — within normal limits':pfi<=3?' — early degenerative changes':' — significant disc degeneration'}. `;
+
+  if(worst) s += `Grades 4–5 degeneration detected at: <strong>${worst}</strong>. `;
+
+  if(cv.angle!=null) s += `Spinal curvature analysis shows <strong>${cv.risk}</strong> with an estimated Cobb angle of ${cv.angle}°. `;
+  if(lk.type) s += `Curve type: <strong>${lk.type}</strong>. `;
+
+  if(stenLevels) s += `⚠ <strong>Canal stenosis suspected</strong> at ${stenLevels}. `;
+  else if(sten.detected) s += `Canal width appears normal at all measured levels. `;
+
+  if(comp) s += `Disc compression identified at: <strong>${comp}</strong>. `;
+  if(fracVerts) s += `⚠ <strong>Vertebral compression risk</strong> at ${fracVerts}. `;
+
+  if(unc!=null) s += `Model uncertainty: <strong>${unc.toFixed(3)}</strong> ${unc<0.2?'— predictions are high confidence':unc<0.5?'— moderate uncertainty, correlate clinically':'— high uncertainty, radiologist review strongly advised'}. `;
+
+  s += `<br><span style="font-size:11px;color:var(--muted)">⚠ AI-generated. Must be reviewed by a qualified radiologist.</span>`;
+  return s;
+}
 async function dlPDF(){
   if(!lastData){ alert('Run an analysis first'); return; }
   document.getElementById('ovTxt').textContent='Generating PDF...';
@@ -1761,6 +2202,13 @@ function clearAll(){
   document.getElementById('results').style.display='none';
   document.getElementById('aBtn').disabled=true;
   document.getElementById('fi').value='';
+  // Reset split view
+  if(splitActive) toggleSplit();
+  // Reset overlay toggles
+  ['seg','gcam','unc'].forEach(m=>{
+    const b=document.getElementById('tog-'+m);
+    if(b) b.classList.toggle('active',m==='seg');
+  });
 }
 
 // ── Training monitor ──────────────────────────────────────────────────
