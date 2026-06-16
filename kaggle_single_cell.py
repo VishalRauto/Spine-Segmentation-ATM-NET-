@@ -18,17 +18,17 @@ from pathlib import Path
 import SimpleITK as sitk
 
 # ── CONFIG ────────────────────────────────────────────────────────
-IMG_SIZE   = 512
-BATCH_SIZE = 6
-ACCUM      = 4        # effective BS=24
-EPOCHS     = 300
-LR         = 3e-4
-LR_MIN     = 5e-6
-WARMUP_EP  = 5
-WD         = 4e-4
-MAX_SPP    = 25
+IMG_SIZE   = 384   # reduced from 512 → 2.2× faster epochs (~200s vs 448s)
+BATCH_SIZE = 8     # increased → better GPU utilization
+ACCUM      = 3     # effective BS=24, more frequent updates
+EPOCHS     = 150   # 150 × 200s = 8.3 hours — fits in 1 Kaggle session
+LR         = 5e-4  # higher LR → faster convergence at start
+LR_MIN     = 1e-5  # higher min LR → better fine-tuning at end
+WARMUP_EP  = 8     # longer warmup for stability with higher LR
+WD         = 3e-4  # slightly less weight decay → more capacity
+MAX_SPP    = 30    # more slices per patient at 384px (less RAM needed)
 NC         = 19
-PATIENCE   = 80
+PATIENCE   = 60    # tighter patience → stops if truly stuck
 SEED       = 42
 torch.manual_seed(SEED); np.random.seed(SEED); random.seed(SEED)
 
@@ -58,7 +58,7 @@ S2A  = {**{i:i for i in range(1,9)}, 100:9, **{201+i:10+i for i in range(8)}}
 CN   = {0:'bg',1:'V1',2:'V2',3:'V3',4:'V4',5:'V5',6:'V6',7:'V7',8:'V8',9:'Sac',
         10:'I1',11:'I2',12:'I3',13:'I4',14:'I5',15:'I6',16:'I7',17:'I8',18:'Canal'}
 RARE = [7, 8, 16, 17]
-CW   = torch.tensor([0,1,1,1,1.5,2,3,8,15,1,6,4,4,5,7,10,18,40,0]).float()
+CW   = torch.tensor([0,1,1,1.2,2,3,4,10,18,1,7,5,5,6,8,12,20,45,0]).float()
 
 def remap(m):
     o = np.zeros_like(m, dtype=np.int32)
