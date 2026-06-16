@@ -152,11 +152,20 @@ class Aug:
             ir=cv2.resize(img,(ns,ns),interpolation=cv2.INTER_LINEAR)
             mr=cv2.resize(msk.astype(np.float32),(ns,ns),interpolation=cv2.INTER_NEAREST).astype(np.int32)
             if ns>=IMG_SIZE:
-                s=(ns-IMG_SIZE)//2; img=ir[s:s+IMG_SIZE,s:s+IMG_SIZE]
+                s=(ns-IMG_SIZE)//2
+                img=ir[s:s+IMG_SIZE,s:s+IMG_SIZE]
                 msk=np.clip(mr[s:s+IMG_SIZE,s:s+IMG_SIZE],0,NC-1)
             else:
-                p=(IMG_SIZE-ns)//2; img=np.pad(ir,p,mode='reflect')[:IMG_SIZE,:IMG_SIZE]
+                p=(IMG_SIZE-ns)//2
+                img=np.pad(ir,p,mode='reflect')[:IMG_SIZE,:IMG_SIZE]
                 msk=np.clip(np.pad(mr,p)[:IMG_SIZE,:IMG_SIZE],0,NC-1)
+        # Ensure output is exactly IMG_SIZE x IMG_SIZE
+        if img.shape[0]!=IMG_SIZE or img.shape[1]!=IMG_SIZE:
+            img=cv2.resize(img,(IMG_SIZE,IMG_SIZE),interpolation=cv2.INTER_LINEAR)
+        if msk.shape[0]!=IMG_SIZE or msk.shape[1]!=IMG_SIZE:
+            msk=cv2.resize(msk.astype(np.float32),(IMG_SIZE,IMG_SIZE),
+                           interpolation=cv2.INTER_NEAREST).astype(np.int64)
+            msk=np.clip(msk,0,NC-1)
         g=random.uniform(0.6,1.6)
         img=np.clip(np.power(img.astype(np.float32)+1e-8,g),0,1)
         img=np.clip(img*random.uniform(0.7,1.3)+random.uniform(-0.12,0.12),0,1)
