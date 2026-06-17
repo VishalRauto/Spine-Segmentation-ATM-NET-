@@ -450,18 +450,23 @@ else:
 
 optimizer=torch.optim.AdamW(model.parameters(),lr=LR,weight_decay=WD,
                             foreach=False, fused=False)  # prevent compile trigger
-# OneCycleLR: better than cosine for limited epoch budget
-# Peaks at epoch WARMUP_EP, decays smoothly — proven for medical segmentation
+# Use OneCycleLR
 sched=torch.optim.lr_scheduler.OneCycleLR(
     optimizer, max_lr=LR,
     steps_per_epoch=len(tr_dl),
     epochs=EPOCHS-start_ep+1,
     pct_start=WARMUP_EP/max(EPOCHS,1),
     anneal_strategy='cos',
-    div_factor=25,        # start LR = max_lr/25
-    final_div_factor=1e4  # end LR = max_lr/10000
+    div_factor=25,
+    final_div_factor=1e4
 )
-scaler=GradScaler(); no_imp=0; t0_total=time.time()
+# Use simple GradScaler — disable if it causes issues
+try:
+    scaler=torch.cuda.amp.GradScaler()
+    _USE_AMP=True
+except:
+    scaler=None; _USE_AMP=False
+no_imp=0; t0_total=time.time()
 
 print(f'\n{"Ep":>4}  {"TrLoss":>8}  {"VaDice":>8}  {"Best":>8}  {"Gap":>6}  {"LR":>8}  {"Sec":>5}')
 print('─'*65)
@@ -480,11 +485,18 @@ for ep in range(start_ep,EPOCHS+1):
         imgs=imgs.to(device,non_blocking=True); msks=msks.to(device,non_blocking=True)
         with torch.enable_grad(), autocast():
             outs=model(imgs); loss=total_loss(outs,msks)/ACCUM
-        scaler.scale(loss).backward()
+        if _USE_AMP:
+            scaler.scale(loss).backward()
+        else:
+            loss.backward()
         if (step+1)%ACCUM==0 or (step+1)==len(tr_dl):
-            scaler.unscale_(optimizer)
-            nn.utils.clip_grad_norm_(model.parameters(),1.0)
-            scaler.step(optimizer); scaler.update()
+            if _USE_AMP:
+                scaler.unscale_(optimizer)
+                nn.utils.clip_grad_norm_(model.parameters(),1.0)
+                scaler.step(optimizer); scaler.update()
+            else:
+                nn.utils.clip_grad_norm_(model.parameters(),1.0)
+                optimizer.step()
             optimizer.zero_grad(set_to_none=True)
         sched.step()  # OneCycleLR steps every batch
         losses.append(loss.item()*ACCUM)
