@@ -7,7 +7,7 @@
 # ── CRITICAL: Patch torch.compile BEFORE any torch imports ───────
 # Kaggle Python 3.12 + PyTorch 2.10 crashes on torch._dynamo
 # This must be the very first thing that runs
-import sys, types, os
+import sys, types, os, functools
 
 os.environ['TORCHDYNAMO_DISABLE'] = '1'
 os.environ['TORCH_COMPILE_DISABLE'] = '1'
@@ -16,41 +16,50 @@ try:
     import torch
 
     if not getattr(torch, '_compile_patched', False):
-        # Create a complete fake _dynamo module with ALL attributes PyTorch needs
-        fake_dynamo = types.ModuleType('torch._dynamo')
-
-        # All functions that PyTorch optimizer/scheduler calls internally
-        _noop     = lambda *a, **kw: None
-        _identity = lambda f=None, *a, **kw: (f if f else lambda x: x)
-        _false    = lambda *a, **kw: False
-
-        fake_dynamo.optimize          = _identity
-        fake_dynamo.disable           = _identity
-        fake_dynamo.reset             = _noop
-        fake_dynamo.graph_break       = _noop   # ← the missing one
-        fake_dynamo.is_compiling      = _false
-        fake_dynamo.allow_in_graph    = _identity
-        fake_dynamo.assume_constant_result = _identity
-        fake_dynamo.run               = _identity
-        fake_dynamo.skip              = _identity
-        fake_dynamo.mark_dynamic      = _noop
-        fake_dynamo.mark_static       = _noop
-        fake_dynamo.maybe_mark_dynamic = _noop
-        fake_dynamo.config            = types.SimpleNamespace(
-            suppress_errors=True, verbose=False,
-            disable=True, cache_size_limit=0
-        )
-        fake_dynamo.exc               = types.ModuleType('torch._dynamo.exc')
-        fake_dynamo.exc.unimplemented = _noop
-
-        sys.modules['torch._dynamo']            = fake_dynamo
-        sys.modules['torch._dynamo.exc']        = fake_dynamo.exc
-        torch._dynamo                           = fake_dynamo
-
-        # Patch torch.compile itself
+        # ── Step 1: Patch torch.compile ──────────────────────────
         torch.compile = lambda f=None, *a, **kw: (f if f else lambda x: x)
+
+        # ── Step 2: Add graph_break to real _dynamo module ───────
+        # PyTorch's optimizer.py calls torch._dynamo.graph_break()
+        # We must add it to the REAL module, not replace the module
+        import torch._dynamo as _dyn
+        if not hasattr(_dyn, 'graph_break'):
+            _dyn.graph_break = lambda *a, **kw: None
+        if not hasattr(_dyn, 'is_compiling'):
+            _dyn.is_compiling = lambda: False
+        if not hasattr(_dyn, 'reset'):
+            _dyn.reset = lambda *a, **kw: None
+        # Disable dynamo evaluation
+        try:
+            _dyn.config.suppress_errors = True
+            _dyn.config.disable = True
+        except: pass
+        try:
+            torch._dynamo.disable = lambda f=None, *a, **kw: (f if f else lambda x: x)
+        except: pass
+
+        # ── Step 3: Patch optimizer._use_grad to skip dynamo ─────
+        # The real crash: _use_grad calls graph_break on a fresh _dynamo import
+        import torch.optim.optimizer as _opt_mod
+        if hasattr(_opt_mod, '_use_grad'):
+            _orig_use_grad = _opt_mod._use_grad
+            def _patched_use_grad(func):
+                @functools.wraps(func)
+                def wrapper(*args, **kwargs):
+                    return func(*args, **kwargs)
+                return wrapper
+            _opt_mod._use_grad = _patched_use_grad
+            # Re-wrap existing optimizer methods
+            for cls in [torch.optim.AdamW, torch.optim.Adam,
+                        torch.optim.SGD, torch.optim.AdamW]:
+                for method_name in ['step', 'zero_grad']:
+                    if hasattr(cls, method_name):
+                        m = getattr(cls, method_name)
+                        if hasattr(m, '__wrapped__'):
+                            setattr(cls, method_name, m.__wrapped__)
+
         torch._compile_patched = True
-        print('torch._dynamo fully patched (Python 3.12 fix)')
+        print('torch._dynamo fully patched (graph_break + _use_grad fix)')
 
 except Exception as _patch_err:
     print(f'Patch warning (non-fatal): {_patch_err}')
