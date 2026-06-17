@@ -18,18 +18,20 @@ from pathlib import Path
 import SimpleITK as sitk
 
 # ── CONFIG ────────────────────────────────────────────────────────
-IMG_SIZE   = 384   # reduced from 512 → 2.2× faster epochs (~200s vs 448s)
-BATCH_SIZE = 8     # increased → better GPU utilization
-ACCUM      = 3     # effective BS=24, more frequent updates
-EPOCHS     = 150   # 150 × 200s = 8.3 hours — fits in 1 Kaggle session
-LR         = 5e-4  # higher LR → faster convergence at start
-LR_MIN     = 1e-5  # higher min LR → better fine-tuning at end
-WARMUP_EP  = 8     # longer warmup for stability with higher LR
-WD         = 3e-4  # slightly less weight decay → more capacity
-MAX_SPP    = 30    # more slices per patient at 384px (less RAM needed)
+IMG_SIZE   = 384   # 384×384 — good balance speed vs quality
+BATCH_SIZE = 8     # T4 16GB fits BS=8 at 384px with AMP
+ACCUM      = 3     # effective BS=24
+EPOCHS     = 300   # 300 epochs — need this many for 0.85+
+LR         = 4e-4  # slightly lower than 5e-4 — more stable
+LR_MIN     = 8e-6
+WARMUP_EP  = 10    # longer warmup
+WD         = 2e-4
+MAX_SPP    = 30
 NC         = 19
-PATIENCE   = 60    # tighter patience → stops if truly stuck
+PATIENCE   = 80    # more patience — don't stop early
 SEED       = 42
+BASE_CH    = 40    # increased from 32 → bigger model → better features
+torch.manual_seed(SEED); np.random.seed(SEED); random.seed(SEED)
 torch.manual_seed(SEED); np.random.seed(SEED); random.seed(SEED)
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -58,7 +60,9 @@ S2A  = {**{i:i for i in range(1,9)}, 100:9, **{201+i:10+i for i in range(8)}}
 CN   = {0:'bg',1:'V1',2:'V2',3:'V3',4:'V4',5:'V5',6:'V6',7:'V7',8:'V8',9:'Sac',
         10:'I1',11:'I2',12:'I3',13:'I4',14:'I5',15:'I6',16:'I7',17:'I8',18:'Canal'}
 RARE = [7, 8, 16, 17]
-CW   = torch.tensor([0,1,1,1.2,2,3,4,10,18,1,7,5,5,6,8,12,20,45,0]).float()
+# Better class weights — calibrated for 384px where upper structures are visible
+CW   = torch.tensor([0, 1,1,1,1.5,2,3, 7,14, 1.5,
+                     6,4,4,5, 7,10,16, 35, 0]).float()
 
 def remap(m):
     o = np.zeros_like(m, dtype=np.int32)
@@ -85,7 +89,8 @@ print(f'Patients: {len(tr_pids)} train | {len(va_pids)} val')
 
 # ── CACHE ─────────────────────────────────────────────────────────
 def build_cache(pids, split):
-    cf = CACHE_DIR / f'{split}_t2_{IMG_SIZE}.npz'
+    # Cache key includes IMG_SIZE so different resolutions get separate caches
+    cf = CACHE_DIR / f'{split}_t2_{IMG_SIZE}_v3.npz'
     if cf.exists():
         print(f'  {split}: loading cache...', end=' ', flush=True)
         d = np.load(cf); t=time.time()
@@ -137,8 +142,13 @@ print(f'Rare slices: {sum(1 for r in tr_rare if r>0.5)}/{len(tr_rare)}')
 # ── AUGMENTATION ──────────────────────────────────────────────────
 class Aug:
     def __call__(self,img,msk):
+        # 1. Horizontal flip
         if random.random()<0.5:
             img=np.fliplr(img).copy(); msk=np.fliplr(msk).copy()
+        # 2. Vertical flip (spine MRI — helps with upper/lower variation)
+        if random.random()<0.3:
+            img=np.flipud(img).copy(); msk=np.flipud(msk).copy()
+        # 3. Rotation ±25°
         if random.random()<0.7:
             a=random.uniform(-25,25)
             M=cv2.getRotationMatrix2D((IMG_SIZE//2,IMG_SIZE//2),a,1.0)
@@ -146,8 +156,9 @@ class Aug:
             mf=cv2.warpAffine(msk.astype(np.float32),M,(IMG_SIZE,IMG_SIZE),
                                flags=cv2.INTER_NEAREST,borderMode=cv2.BORDER_CONSTANT)
             msk=np.clip(mf.astype(np.int32),0,NC-1)
+        # 4. Scale crop
         if random.random()<0.4:
-            scale=random.uniform(0.85,1.15)
+            scale=random.uniform(0.80,1.20)
             ns=int(IMG_SIZE*scale)
             ir=cv2.resize(img,(ns,ns),interpolation=cv2.INTER_LINEAR)
             mr=cv2.resize(msk.astype(np.float32),(ns,ns),interpolation=cv2.INTER_NEAREST).astype(np.int32)
@@ -159,21 +170,36 @@ class Aug:
                 p=(IMG_SIZE-ns)//2
                 img=np.pad(ir,p,mode='reflect')[:IMG_SIZE,:IMG_SIZE]
                 msk=np.clip(np.pad(mr,p)[:IMG_SIZE,:IMG_SIZE],0,NC-1)
-        # Ensure output is exactly IMG_SIZE x IMG_SIZE
+        # 5. Elastic deformation — spine curvature variation
+        if random.random()<0.35:
+            try:
+                from scipy.ndimage import gaussian_filter, map_coordinates
+                h,w=img.shape
+                sigma=h*0.07; alpha=h*0.45
+                dx=gaussian_filter(np.random.randn(h,w),sigma)*alpha
+                dy=gaussian_filter(np.random.randn(h,w),sigma)*alpha
+                x,y=np.meshgrid(np.arange(w),np.arange(h))
+                xi=np.clip(x+dx,0,w-1).ravel(); yi=np.clip(y+dy,0,h-1).ravel()
+                img=map_coordinates(img,[yi,xi],order=1).reshape(h,w).astype(np.float32)
+                mf=map_coordinates(msk.astype(float),[yi,xi],order=0).reshape(h,w)
+                msk=np.clip(mf.astype(np.int32),0,NC-1)
+            except: pass
+        # 6. Ensure correct size
         if img.shape[0]!=IMG_SIZE or img.shape[1]!=IMG_SIZE:
             img=cv2.resize(img,(IMG_SIZE,IMG_SIZE),interpolation=cv2.INTER_LINEAR)
         if msk.shape[0]!=IMG_SIZE or msk.shape[1]!=IMG_SIZE:
-            msk=cv2.resize(msk.astype(np.float32),(IMG_SIZE,IMG_SIZE),
-                           interpolation=cv2.INTER_NEAREST).astype(np.int64)
-            msk=np.clip(msk,0,NC-1)
-        g=random.uniform(0.6,1.6)
+            msk=np.clip(cv2.resize(msk.astype(np.float32),(IMG_SIZE,IMG_SIZE),
+                        interpolation=cv2.INTER_NEAREST).astype(np.int64),0,NC-1)
+        # 7. Intensity augmentation
+        g=random.uniform(0.55,1.65)
         img=np.clip(np.power(img.astype(np.float32)+1e-8,g),0,1)
-        img=np.clip(img*random.uniform(0.7,1.3)+random.uniform(-0.12,0.12),0,1)
-        if random.random()<0.4:
-            img=np.clip(img+np.random.normal(0,0.012,img.shape),0,1)
-        if random.random()<0.3:
+        img=np.clip(img*random.uniform(0.65,1.35)+random.uniform(-0.15,0.15),0,1)
+        if random.random()<0.45:
+            img=np.clip(img+np.random.normal(0,0.015,img.shape),0,1)
+        # 8. Cutout
+        if random.random()<0.35:
             cy,cx=random.randint(0,IMG_SIZE),random.randint(0,IMG_SIZE)
-            r=random.randint(12,28)
+            r=random.randint(16,40)
             img[max(0,cy-r):min(IMG_SIZE,cy+r),max(0,cx-r):min(IMG_SIZE,cx+r)]=0
         return img.astype(np.float32),msk.astype(np.int64)
 
@@ -264,7 +290,8 @@ def boundary(lg,tg):
 
 def compound(lg,tg):
     tc=tg.clamp(0,NC-1)
-    return F.cross_entropy(lg,tc,label_smoothing=0.02)+dice_w(lg,tc)+0.3*focal(lg,tc)+0.15*boundary(lg,tc)
+    # label_smoothing=0.05 helps rare classes not get over-suppressed
+    return F.cross_entropy(lg,tc,label_smoothing=0.05)+dice_w(lg,tc)+0.3*focal(lg,tc)+0.15*boundary(lg,tc)
 
 def total_loss(outs,tg):
     o1,o2,o3,ax=outs
@@ -291,7 +318,7 @@ def get_lr(ep,start_ep):
     return LR_MIN+0.5*(LR-LR_MIN)*(1+np.cos(np.pi*t))
 
 # ── BUILD MODEL & DATALOADERS ─────────────────────────────────────
-model=ResUNet(b=32,nc=NC,drop=0.25).to(device)
+model=ResUNet(b=BASE_CH,nc=NC,drop=0.20).to(device)  # b=40, less dropout
 n_params=sum(p.numel() for p in model.parameters())
 print(f'\nModel: ResUNet+CBAM {n_params/1e6:.2f}M params')
 
@@ -317,6 +344,17 @@ else:
     print('Starting fresh')
 
 optimizer=torch.optim.AdamW(model.parameters(),lr=LR,weight_decay=WD)
+# OneCycleLR: better than cosine for limited epoch budget
+# Peaks at epoch WARMUP_EP, decays smoothly — proven for medical segmentation
+sched=torch.optim.lr_scheduler.OneCycleLR(
+    optimizer, max_lr=LR,
+    steps_per_epoch=len(tr_dl),
+    epochs=EPOCHS-start_ep+1,
+    pct_start=WARMUP_EP/max(EPOCHS,1),
+    anneal_strategy='cos',
+    div_factor=25,        # start LR = max_lr/25
+    final_div_factor=1e4  # end LR = max_lr/10000
+)
 scaler=GradScaler(); no_imp=0; t0_total=time.time()
 
 print(f'\n{"Ep":>4}  {"TrLoss":>8}  {"VaDice":>8}  {"Best":>8}  {"Gap":>6}  {"LR":>8}  {"Sec":>5}')
@@ -324,8 +362,7 @@ print('─'*65)
 
 # ── TRAINING LOOP ─────────────────────────────────────────────────
 for ep in range(start_ep,EPOCHS+1):
-    lr_now=get_lr(ep,start_ep)
-    for pg in optimizer.param_groups: pg['lr']=lr_now
+    lr_now=sched.get_last_lr()[0] if hasattr(sched,'get_last_lr') else LR
 
     model.train(); losses=[]; t0=time.time()
     optimizer.zero_grad(set_to_none=True)
@@ -339,8 +376,10 @@ for ep in range(start_ep,EPOCHS+1):
             nn.utils.clip_grad_norm_(model.parameters(),1.0)
             scaler.step(optimizer); scaler.update()
             optimizer.zero_grad(set_to_none=True)
+        sched.step()  # OneCycleLR steps every batch
         losses.append(loss.item()*ACCUM)
     tr_loss=float(np.mean(losses)); ep_sec=time.time()-t0
+    lr_now=sched.get_last_lr()[0]
 
     model.eval(); Dc=defaultdict(list)
     with torch.no_grad():
