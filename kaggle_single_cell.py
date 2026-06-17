@@ -73,9 +73,30 @@ import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.cuda.amp import autocast, GradScaler
 from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 from collections import defaultdict
+
+# autocast wrapper — handles PyTorch 2.0 (no device_type) and 2.10+ (requires device_type)
+_device_str = 'cuda' if torch.cuda.is_available() else 'cpu'
+class autocast:
+    def __init__(self, enabled=True, dtype=None):
+        try:
+            self._ctx = torch.amp.autocast(device_type=_device_str, enabled=enabled)
+        except Exception:
+            try:
+                self._ctx = torch.cuda.amp.autocast(enabled=enabled)
+            except Exception:
+                self._ctx = None
+    def __enter__(self):
+        return self._ctx.__enter__() if self._ctx else None
+    def __exit__(self, *a):
+        return self._ctx.__exit__(*a) if self._ctx else None
+
+# GradScaler — try both API locations
+try:
+    from torch.amp import GradScaler as _GS
+except ImportError:
+    from torch.cuda.amp import GradScaler as _GS
 from pathlib import Path
 import SimpleITK as sitk
 
@@ -460,12 +481,14 @@ sched=torch.optim.lr_scheduler.OneCycleLR(
     div_factor=25,
     final_div_factor=1e4
 )
-# Use simple GradScaler — disable if it causes issues
+# Use GradScaler — disable if it causes issues
 try:
-    scaler=torch.cuda.amp.GradScaler()
+    scaler=_GS()
     _USE_AMP=True
+    print('AMP enabled (fp16)')
 except:
     scaler=None; _USE_AMP=False
+    print('AMP disabled (fp32 fallback)')
 no_imp=0; t0_total=time.time()
 
 print(f'\n{"Ep":>4}  {"TrLoss":>8}  {"VaDice":>8}  {"Best":>8}  {"Gap":>6}  {"LR":>8}  {"Sec":>5}')
