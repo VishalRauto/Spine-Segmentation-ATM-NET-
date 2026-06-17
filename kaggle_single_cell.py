@@ -457,15 +457,19 @@ scaler=GradScaler(); no_imp=0; t0_total=time.time()
 print(f'\n{"Ep":>4}  {"TrLoss":>8}  {"VaDice":>8}  {"Best":>8}  {"Gap":>6}  {"LR":>8}  {"Sec":>5}')
 print('─'*65)
 
+# Ensure gradients are enabled globally for training
+torch.set_grad_enabled(True)
+
 # ── TRAINING LOOP ─────────────────────────────────────────────────
 for ep in range(start_ep,EPOCHS+1):
     lr_now=sched.get_last_lr()[0] if hasattr(sched,'get_last_lr') else LR
 
-    model.train(); losses=[]; t0=time.time()
+    model.train()  # ensure train mode — critical after eval() in resume/validation
+    losses=[]; t0=time.time()
     optimizer.zero_grad(set_to_none=True)
     for step,(imgs,msks) in enumerate(tr_dl):
         imgs=imgs.to(device,non_blocking=True); msks=msks.to(device,non_blocking=True)
-        with autocast():
+        with torch.enable_grad(), autocast():
             outs=model(imgs); loss=total_loss(outs,msks)/ACCUM
         scaler.scale(loss).backward()
         if (step+1)%ACCUM==0 or (step+1)==len(tr_dl):
