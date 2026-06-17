@@ -3,8 +3,44 @@
 # Copy ALL of this into ONE new cell in Kaggle, then Run
 # Expected: Dice 0.85+ after 300 epochs (~4-6 hours on T4)
 # ══════════════════════════════════════════════════════════════════
-import os, sys, time, random, gc, json, warnings, glob
+
+# ── CRITICAL: Patch torch.compile BEFORE any torch imports ───────
+# Kaggle Python 3.12 + PyTorch 2.10 crashes on torch._dynamo
+# This must be the very first thing that runs
+import sys, types
+
+# Patch torch._dynamo to prevent the GuardSource crash
+try:
+    import torch
+    if not getattr(torch, '_compile_patched', False):
+        # Disable dynamo entirely
+        torch._dynamo = types.ModuleType('torch._dynamo')
+        torch._dynamo.optimize = lambda f=None, *a, **kw: (f if f else lambda x: x)
+        torch._dynamo.disable  = lambda f=None, *a, **kw: (f if f else lambda x: x)
+        torch._dynamo.reset    = lambda *a, **kw: None
+        torch._dynamo.is_compiling = lambda: False
+        sys.modules['torch._dynamo'] = torch._dynamo
+
+        # Patch compile to no-op
+        torch.compile = lambda f=None, *a, **kw: (f if f else lambda x: x)
+        torch._compile_patched = True
+
+        # Disable AdamW's internal compile attempt
+        import torch.optim.adamw
+        if hasattr(torch.optim.adamw, '_multi_tensor_adamw'):
+            pass  # already available
+
+        # Set env var to disable dynamo
+        import os
+        os.environ['TORCHDYNAMO_DISABLE'] = '1'
+        os.environ['TORCH_COMPILE_DISABLE'] = '1'
+        print('torch.compile disabled (Python 3.12 fix)')
+except Exception as _e:
+    print(f'Patch warning: {_e}')
+
+import os, time, random, gc, json, warnings, glob
 warnings.filterwarnings('ignore')
+import sys
 import numpy as np
 import cv2
 import pandas as pd
@@ -386,7 +422,8 @@ if resume_path:
 else:
     print('Starting fresh (no checkpoint found)')
 
-optimizer=torch.optim.AdamW(model.parameters(),lr=LR,weight_decay=WD)
+optimizer=torch.optim.AdamW(model.parameters(),lr=LR,weight_decay=WD,
+                            foreach=False, fused=False)  # prevent compile trigger
 # OneCycleLR: better than cosine for limited epoch budget
 # Peaks at epoch WARMUP_EP, decays smoothly — proven for medical segmentation
 sched=torch.optim.lr_scheduler.OneCycleLR(
