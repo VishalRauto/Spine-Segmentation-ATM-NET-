@@ -52,6 +52,37 @@ OUTPUT_DIR = Path('/kaggle/working')
 CKPT_BEST  = OUTPUT_DIR / 'best_model.pth'
 CKPT_LAST  = OUTPUT_DIR / 'last_model.pth'
 CACHE_DIR  = OUTPUT_DIR / 'cache'; CACHE_DIR.mkdir(exist_ok=True)
+
+# ── Persistent checkpoint: load from previous session if available ──
+# Kaggle Output from previous session is available at:
+# /kaggle/input/<your-output-dataset>/
+def find_resume_ckpt():
+    """Search all possible locations for a checkpoint to resume from."""
+    candidates = [
+        CKPT_LAST,   # current session last
+        CKPT_BEST,   # current session best
+    ]
+    # Also search Kaggle input for previously saved checkpoints
+    for pattern in ['/kaggle/input/**/last_model.pth',
+                    '/kaggle/input/**/best_model.pth',
+                    '/kaggle/input/**/*.pth']:
+        found = glob.glob(pattern, recursive=True)
+        candidates.extend([Path(f) for f in found])
+
+    best_ep, best_path = -1, None
+    for p in candidates:
+        if not Path(p).exists(): continue
+        try:
+            import torch as _t
+            c = _t.load(str(p), map_location='cpu')
+            ep = c.get('epoch', 0)
+            keys = list(c.get('model_state_dict', {}).keys())
+            # Only accept compatible architecture (same key names)
+            if ep > best_ep and any('conv.0.weight' in k for k in keys):
+                best_ep, best_path = ep, p
+        except: pass
+    return best_path, best_ep
+
 print(f'Images: {IMAGES_DIR} ({len(mhas)} files)')
 print(f'Masks : {MASKS_DIR}')
 
@@ -329,19 +360,31 @@ va_dl=DataLoader(DS(vi,vm),batch_size=BATCH_SIZE,shuffle=False,num_workers=0,pin
 print(f'Batches: {len(tr_dl)} train | {len(va_dl)} val')
 
 # ── RESUME OR START FRESH ─────────────────────────────────────────
+# Also copy cache from previous session if available
+for pattern in [f'/kaggle/input/**/*_t2_{IMG_SIZE}_v3.npz']:
+    for old_cache in glob.glob(pattern, recursive=True):
+        dst = CACHE_DIR / Path(old_cache).name
+        if not dst.exists():
+            import shutil
+            shutil.copy(old_cache, dst)
+            print(f'Copied cache from previous session: {Path(old_cache).name}')
+
 start_ep=1; best=0.0
-if CKPT_BEST.exists():
-    ck_b=torch.load(str(CKPT_BEST),map_location=device)
-    ep_b=ck_b.get('epoch',0); ck_use=ck_b
-    if CKPT_LAST.exists():
-        ck_l=torch.load(str(CKPT_LAST),map_location=device)
-        if ck_l.get('epoch',0)>ep_b: ck_use=ck_l
-    model.load_state_dict(ck_use['model_state_dict'],strict=False)
-    best=ck_b.get('best_dice',0.0)
-    start_ep=ck_use.get('epoch',0)+1
-    print(f'Resumed: ep{ck_use["epoch"]} best={best:.4f} → ep{start_ep}')
+resume_path, resume_ep = find_resume_ckpt()
+if resume_path:
+    print(f'\nResuming from: {resume_path} (epoch {resume_ep})')
+    ck_use = torch.load(str(resume_path), map_location=device)
+    # If resuming from Kaggle input (previous session), copy to working dir
+    if str(resume_path).startswith('/kaggle/input'):
+        torch.save(ck_use, str(CKPT_BEST))
+        torch.save(ck_use, str(CKPT_LAST))
+        print('  Copied checkpoint to /kaggle/working/')
+    model.load_state_dict(ck_use['model_state_dict'], strict=False)
+    best      = ck_use.get('best_dice', 0.0)
+    start_ep  = ck_use.get('epoch', 0) + 1
+    print(f'  best={best:.4f} | continuing from epoch {start_ep}')
 else:
-    print('Starting fresh')
+    print('Starting fresh (no checkpoint found)')
 
 optimizer=torch.optim.AdamW(model.parameters(),lr=LR,weight_decay=WD)
 # OneCycleLR: better than cosine for limited epoch budget
@@ -405,14 +448,25 @@ for ep in range(start_ep,EPOCHS+1):
         pc={CN[c]:float(np.mean(v)) for c,v in Dc.items() if v}
         torch.save({'epoch':ep,'model_state_dict':model.state_dict(),
                     'best_dice':best,'per_class_dice':pc,
-                    'cfg':{'img_size':IMG_SIZE,'nc':NC}},CKPT_BEST)
+                    'cfg':{'img_size':IMG_SIZE,'nc':NC,'base_ch':BASE_CH}},CKPT_BEST)
         with open(OUTPUT_DIR/'results.json','w') as f:
             json.dump({'epoch':ep,'best_dice':best,'per_class':pc},f,indent=2)
     else:
         no_imp+=1
 
-    if ep%5==0:
-        torch.save({'epoch':ep,'model_state_dict':model.state_dict(),'best_dice':best},CKPT_LAST)
+    # Save last checkpoint every 3 epochs (frequent saves = less lost work)
+    if ep%3==0 or ep==EPOCHS:
+        torch.save({'epoch':ep,'model_state_dict':model.state_dict(),
+                    'best_dice':best,
+                    'cfg':{'img_size':IMG_SIZE,'nc':NC,'base_ch':BASE_CH}},CKPT_LAST)
+
+    # Also save cache files to output so next session can reuse them
+    if ep==1:
+        for cf in CACHE_DIR.glob('*.npz'):
+            dst = OUTPUT_DIR / cf.name
+            if not dst.exists():
+                import shutil; shutil.copy(cf, dst)
+                print(f'  Cache exported: {cf.name}')
 
     flag='  ★' if vd==best else ''
     print(f'{ep:>4}  {tr_loss:>8.4f}  {vd:>8.4f}  {best:>8.4f}  {gap:>+6.3f}  {lr_now:>8.2e}  {ep_sec:>4.0f}s{flag}')
