@@ -7,36 +7,53 @@
 # ── CRITICAL: Patch torch.compile BEFORE any torch imports ───────
 # Kaggle Python 3.12 + PyTorch 2.10 crashes on torch._dynamo
 # This must be the very first thing that runs
-import sys, types
+import sys, types, os
 
-# Patch torch._dynamo to prevent the GuardSource crash
+os.environ['TORCHDYNAMO_DISABLE'] = '1'
+os.environ['TORCH_COMPILE_DISABLE'] = '1'
+
 try:
     import torch
-    if not getattr(torch, '_compile_patched', False):
-        # Disable dynamo entirely
-        torch._dynamo = types.ModuleType('torch._dynamo')
-        torch._dynamo.optimize = lambda f=None, *a, **kw: (f if f else lambda x: x)
-        torch._dynamo.disable  = lambda f=None, *a, **kw: (f if f else lambda x: x)
-        torch._dynamo.reset    = lambda *a, **kw: None
-        torch._dynamo.is_compiling = lambda: False
-        sys.modules['torch._dynamo'] = torch._dynamo
 
-        # Patch compile to no-op
+    if not getattr(torch, '_compile_patched', False):
+        # Create a complete fake _dynamo module with ALL attributes PyTorch needs
+        fake_dynamo = types.ModuleType('torch._dynamo')
+
+        # All functions that PyTorch optimizer/scheduler calls internally
+        _noop     = lambda *a, **kw: None
+        _identity = lambda f=None, *a, **kw: (f if f else lambda x: x)
+        _false    = lambda *a, **kw: False
+
+        fake_dynamo.optimize          = _identity
+        fake_dynamo.disable           = _identity
+        fake_dynamo.reset             = _noop
+        fake_dynamo.graph_break       = _noop   # ← the missing one
+        fake_dynamo.is_compiling      = _false
+        fake_dynamo.allow_in_graph    = _identity
+        fake_dynamo.assume_constant_result = _identity
+        fake_dynamo.run               = _identity
+        fake_dynamo.skip              = _identity
+        fake_dynamo.mark_dynamic      = _noop
+        fake_dynamo.mark_static       = _noop
+        fake_dynamo.maybe_mark_dynamic = _noop
+        fake_dynamo.config            = types.SimpleNamespace(
+            suppress_errors=True, verbose=False,
+            disable=True, cache_size_limit=0
+        )
+        fake_dynamo.exc               = types.ModuleType('torch._dynamo.exc')
+        fake_dynamo.exc.unimplemented = _noop
+
+        sys.modules['torch._dynamo']            = fake_dynamo
+        sys.modules['torch._dynamo.exc']        = fake_dynamo.exc
+        torch._dynamo                           = fake_dynamo
+
+        # Patch torch.compile itself
         torch.compile = lambda f=None, *a, **kw: (f if f else lambda x: x)
         torch._compile_patched = True
+        print('torch._dynamo fully patched (Python 3.12 fix)')
 
-        # Disable AdamW's internal compile attempt
-        import torch.optim.adamw
-        if hasattr(torch.optim.adamw, '_multi_tensor_adamw'):
-            pass  # already available
-
-        # Set env var to disable dynamo
-        import os
-        os.environ['TORCHDYNAMO_DISABLE'] = '1'
-        os.environ['TORCH_COMPILE_DISABLE'] = '1'
-        print('torch.compile disabled (Python 3.12 fix)')
-except Exception as _e:
-    print(f'Patch warning: {_e}')
+except Exception as _patch_err:
+    print(f'Patch warning (non-fatal): {_patch_err}')
 
 import os, time, random, gc, json, warnings, glob
 warnings.filterwarnings('ignore')
