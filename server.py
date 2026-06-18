@@ -21,12 +21,13 @@ UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 def _pick_ckpt():
     import torch
     candidates = [
-        (BASE / "outputs/gpu_run/kaggle_converted.pth", 256),
-        (BASE / "outputs/gpu_run/last_model.pth",       192),
-        (BASE / "outputs/gpu_run/best_model.pth",       192),
-        (CKPT_CPU,                                      192),
+        (BASE / "outputs/gpu_run/kaggle_v2.pth",        384),  # new ep77 dice=0.77
+        (BASE / "outputs/gpu_run/kaggle_converted.pth",  256),  # old ep48 dice=0.65
+        (BASE / "outputs/gpu_run/last_model.pth",        192),
+        (BASE / "outputs/gpu_run/best_model.pth",        192),
+        (CKPT_CPU,                                       192),
     ]
-    best_path, best_dice, best_size = None, -1.0, 192
+    best_path, best_dice, best_size, best_base_ch = None, -1.0, 192, 32
     for p, sz in candidates:
         if not p.exists(): continue
         try:
@@ -35,19 +36,23 @@ def _pick_ckpt():
             if not (any(k == "e1.conv.0.weight" for k in keys) and
                     any("sa.conv.0.weight" in k  for k in keys)):
                 print(f"  [ckpt] Skipping {p.name} — incompatible"); continue
-            ep, dice = c.get("epoch", 0), c.get("best_dice", 0.0)
-            print(f"  [ckpt] {p.name}: ep={ep} dice={dice:.4f} sz={sz} ✓")
+            ep   = c.get("epoch", 0)
+            dice = c.get("best_dice", 0.0)
+            cfg  = c.get("cfg", {})
+            base_ch = cfg.get("base_ch", 32)
+            img_sz  = cfg.get("img_size", sz)
+            print(f"  [ckpt] {p.name}: ep={ep} dice={dice:.4f} sz={img_sz} base_ch={base_ch} ✓")
             if dice > best_dice:
-                best_dice, best_path, best_size = dice, p, sz
+                best_dice, best_path, best_size, best_base_ch = dice, p, img_sz, base_ch
         except Exception as e:
             print(f"  [ckpt] {p.name}: error — {e}")
     if best_path:
-        print(f"  [ckpt] Using: {best_path.name} (dice={best_dice:.4f}, size={best_size})")
+        print(f"  [ckpt] Using: {best_path.name} (dice={best_dice:.4f}, sz={best_size}, base_ch={best_base_ch})")
     else:
         print("  [ckpt] WARNING: No compatible checkpoint found.")
-    return best_path, best_size
+    return best_path, best_size, best_base_ch
 
-CKPT, INFER_SIZE = _pick_ckpt()
+CKPT, INFER_SIZE, MODEL_BASE_CH = _pick_ckpt()
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 500 * 1024 * 1024
@@ -157,7 +162,7 @@ def get_model():
                 d=self.d1(torch.cat([self.u1(d),e1],1))
                 return self.out(d)
 
-        _model = ResUNet(b=32, nc=NUM_CLASSES, drop=0.25).to(_device)
+        _model = ResUNet(b=MODEL_BASE_CH, nc=NUM_CLASSES, drop=0.20).to(_device)
         if CKPT and CKPT.exists():
             import torch as _t
             ckpt = _t.load(str(CKPT), map_location=_device)
@@ -2907,7 +2912,7 @@ if __name__ == "__main__":
             c = torch.load(str(CKPT), map_location="cpu")
             print(f"  Model  : epoch {c.get('epoch','?')} | best_dice={c.get('best_dice',0):.4f}")
         except: pass
-    print(f"  Size   : {INFER_SIZE}×{INFER_SIZE}")
+    print(f"  Size   : {INFER_SIZE}×{INFER_SIZE} | base_ch={MODEL_BASE_CH}")
     print(f"  Open   : http://localhost:5000")
     print("=" * 52)
     app.run(host="0.0.0.0", port=5000, debug=False, threaded=True)
