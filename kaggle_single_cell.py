@@ -11,6 +11,7 @@ import sys, types, os, functools
 
 os.environ['TORCHDYNAMO_DISABLE'] = '1'
 os.environ['TORCH_COMPILE_DISABLE'] = '1'
+os.environ['PYTORCH_ALLOC_CONF'] = 'expandable_segments:True'  # prevents OOM fragmentation
 
 try:
     import torch
@@ -102,8 +103,8 @@ import SimpleITK as sitk
 
 # ── CONFIG ────────────────────────────────────────────────────────
 IMG_SIZE   = 384   # 384×384 — good balance speed vs quality
-BATCH_SIZE = 8     # T4 16GB fits BS=8 at 384px with AMP
-ACCUM      = 3     # effective BS=24
+BATCH_SIZE = 5     # reduced from 8 to prevent OOM on long runs
+ACCUM      = 5     # keeps effective BS=25
 EPOCHS     = 300   # 300 epochs — need this many for 0.85+
 LR         = 4e-4  # slightly lower than 5e-4 — more stable
 LR_MIN     = 8e-6
