@@ -1379,17 +1379,137 @@ def run_pred(file_bytes, filename, patient_info=None):
         finally:
             tmp.unlink(missing_ok=True)
 
+    # ── Ensemble: load secondary checkpoint (kaggle_converted.pth) ──────
+    # Averaging softmax outputs from two checkpoints gives free +1-3% dice
+    _model2      = None
+    _model2_lock = threading.Lock()
+
+    def _get_model2():
+        """Lazy-load the second checkpoint for ensembling."""
+        global _model2
+        with _model2_lock:
+            if _model2 is not None:
+                return _model2
+            ckpt2_path = BASE / "outputs/gpu_run/kaggle_converted.pth"
+            if not ckpt2_path.exists():
+                return None
+            try:
+                import torch.nn as _nn
+                # Rebuild same architecture — must match kaggle_converted.pth (base_ch=32)
+                class _CA(_nn.Module):
+                    def __init__(self,ch,r=8):
+                        super().__init__(); r=max(1,ch//r)
+                        self.avg=_nn.AdaptiveAvgPool2d(1); self.max=_nn.AdaptiveMaxPool2d(1)
+                        self.fc=_nn.Sequential(_nn.Flatten(),_nn.Linear(ch,r),_nn.ReLU(True),_nn.Linear(r,ch),_nn.Sigmoid())
+                    def forward(self,x):
+                        a=self.fc(self.avg(x))+self.fc(self.max(x))
+                        return x*a.clamp(0,1).view(x.shape[0],-1,1,1)
+                class _SA(_nn.Module):
+                    def __init__(self):
+                        super().__init__()
+                        self.conv=_nn.Sequential(_nn.Conv2d(2,1,7,padding=3,bias=False),_nn.BatchNorm2d(1),_nn.Sigmoid())
+                    def forward(self,x):
+                        return x*self.conv(torch.cat([x.mean(1,keepdim=True),x.max(1,keepdim=True)[0]],1))
+                class _RB(_nn.Module):
+                    def __init__(self,ch):
+                        super().__init__()
+                        self.net=_nn.Sequential(_nn.Conv2d(ch,ch,3,1,1,bias=False),_nn.BatchNorm2d(ch),_nn.ReLU(True),_nn.Conv2d(ch,ch,3,1,1,bias=False),_nn.BatchNorm2d(ch))
+                        self.ca=_CA(ch); self.sa=_SA(); self.act=_nn.ReLU(True)
+                    def forward(self,x): return self.act(self.sa(self.ca(self.net(x)))+x)
+                class _Enc(_nn.Module):
+                    def __init__(self,ci,co,drop=0.0):
+                        super().__init__()
+                        self.conv=_nn.Sequential(_nn.Conv2d(ci,co,3,1,1,bias=False),_nn.BatchNorm2d(co),_nn.ReLU(True),_nn.Conv2d(co,co,3,1,1,bias=False),_nn.BatchNorm2d(co),_nn.ReLU(True))
+                        self.res=_RB(co); self.drop=_nn.Dropout2d(drop) if drop>0 else _nn.Identity()
+                    def forward(self,x): return self.drop(self.res(self.conv(x)))
+                class _ResUNet2(_nn.Module):
+                    def __init__(self,b=32,nc=NUM_CLASSES):
+                        super().__init__()
+                        self.e1=_Enc(1,b); self.e2=_Enc(b,b*2,0.06); self.e3=_Enc(b*2,b*4,0.12); self.e4=_Enc(b*4,b*8,0.16)
+                        self.bn=_nn.Sequential(_Enc(b*8,b*16,0.20),_nn.Dropout2d(0.20)); self.pool=_nn.MaxPool2d(2)
+                        self.u4=_nn.ConvTranspose2d(b*16,b*8,2,2); self.d4=_Enc(b*16,b*8,0.08)
+                        self.u3=_nn.ConvTranspose2d(b*8,b*4,2,2);  self.d3=_Enc(b*8,b*4,0.04)
+                        self.u2=_nn.ConvTranspose2d(b*4,b*2,2,2);  self.d2=_Enc(b*4,b*2)
+                        self.u1=_nn.ConvTranspose2d(b*2,b,2,2);    self.d1=_Enc(b*2,b)
+                        self.out=_nn.Conv2d(b,nc,1)
+                    def forward(self,x):
+                        e1=self.e1(x); e2=self.e2(self.pool(e1)); e3=self.e3(self.pool(e2)); e4=self.e4(self.pool(e3))
+                        d=self.bn(self.pool(e4))
+                        d=self.d4(torch.cat([self.u4(d),e4],1)); d=self.d3(torch.cat([self.u3(d),e3],1))
+                        d=self.d2(torch.cat([self.u2(d),e2],1)); d=self.d1(torch.cat([self.u1(d),e1],1))
+                        return self.out(d)
+                ck2   = torch.load(str(ckpt2_path), map_location=device, weights_only=False)
+                b2    = ck2.get("cfg", {}).get("base_ch", 32)
+                sz2   = ck2.get("cfg", {}).get("img_size", 256)
+                _m2   = _ResUNet2(b=b2, nc=NUM_CLASSES).to(device)
+                _m2.load_state_dict(ck2["model_state_dict"], strict=False)
+                _m2.eval()
+                _model2 = (_m2, sz2)
+                print(f"[Ensemble] Loaded kaggle_converted.pth (base_ch={b2}, sz={sz2})")
+            except Exception as _e2:
+                print(f"[Ensemble] Could not load second checkpoint: {_e2}")
+                _model2 = None
+            return _model2
+
+    m2_pair = _get_model2()
+
+    def _tta_predict(mdl, img_r, dev, infer_sz):
+        """
+        Test-Time Augmentation: h-flip + v-flip + 2 rotations.
+        Returns averaged softmax probs (C, H, W).
+        """
+        import torch.nn.functional as _F
+        H, W = img_r.shape
+        # Resize to model's expected size if different
+        if H != infer_sz or W != infer_sz:
+            img_in = cv2.resize(img_r, (infer_sz, infer_sz), cv2.INTER_LINEAR)
+        else:
+            img_in = img_r
+
+        def _pred(arr):
+            t = torch.from_numpy(arr[None, None]).float().to(dev)
+            with torch.no_grad():
+                return _F.softmax(mdl(t), 1).squeeze(0).cpu().numpy()
+
+        p0 = _pred(img_in)                                          # original
+        p1 = np.flip(_pred(np.fliplr(img_in)), axis=2).copy()      # h-flip
+        p2 = np.flip(_pred(np.flipud(img_in)), axis=1).copy()      # v-flip
+        # ±10° rotations
+        M_p = cv2.getRotationMatrix2D((infer_sz//2, infer_sz//2),  10, 1.0)
+        M_m = cv2.getRotationMatrix2D((infer_sz//2, infer_sz//2), -10, 1.0)
+        img_rp = cv2.warpAffine(img_in, M_p, (infer_sz, infer_sz), flags=cv2.INTER_LINEAR)
+        img_rm = cv2.warpAffine(img_in, M_m, (infer_sz, infer_sz), flags=cv2.INTER_LINEAR)
+        M_pi = cv2.invertAffineTransform(M_p)
+        M_mi = cv2.invertAffineTransform(M_m)
+        raw_p = _pred(img_rp); raw_m = _pred(img_rm)
+        # Undo rotation on each class channel
+        p3 = np.stack([cv2.warpAffine(raw_p[c], M_pi, (infer_sz, infer_sz), flags=cv2.INTER_LINEAR) for c in range(NUM_CLASSES)])
+        p4 = np.stack([cv2.warpAffine(raw_m[c], M_mi, (infer_sz, infer_sz), flags=cv2.INTER_LINEAR) for c in range(NUM_CLASSES)])
+        avg = (p0 + p1 + p2 + p3 + p4) / 5.0
+        # Resize back to display size if needed
+        if infer_sz != H:
+            avg = np.stack([cv2.resize(avg[c], (W, H), cv2.INTER_LINEAR) for c in range(NUM_CLASSES)])
+        return avg
+
     # Run inference on all slices
     all_preds = []
     for sl in slices:
         p1, p99 = np.percentile(sl, [0.5, 99.5])
         img_n = np.clip((sl - p1) / (p99 - p1 + 1e-8), 0, 1).astype(np.float32)
         img_r = cv2.resize(img_n, (size, size), interpolation=cv2.INTER_LINEAR)
-        t     = torch.from_numpy(img_r[None, None]).float().to(device)
-        with torch.no_grad():
-            pr  = F.softmax(model(t), 1)
-            pr2 = F.softmax(model(torch.flip(t, [-1])), 1)
-            avg = ((pr + torch.flip(pr2, [-1])) / 2).squeeze(0).cpu().numpy()
+
+        # Primary model TTA
+        avg = _tta_predict(model, img_r, device, size)
+
+        # Ensemble with second checkpoint (weighted 0.7 / 0.3)
+        if m2_pair is not None:
+            m2_mdl, m2_sz = m2_pair
+            avg2 = _tta_predict(m2_mdl, img_r, device, m2_sz)
+            # Resize avg2 to match primary output size if needed
+            if avg2.shape[1] != size or avg2.shape[2] != size:
+                avg2 = np.stack([cv2.resize(avg2[c], (size, size), cv2.INTER_LINEAR)
+                                 for c in range(NUM_CLASSES)])
+            avg = 0.70 * avg + 0.30 * avg2
 
         # Background-bias correction
         bg_prob = avg[0]; fg_max = avg[1:].max(0)

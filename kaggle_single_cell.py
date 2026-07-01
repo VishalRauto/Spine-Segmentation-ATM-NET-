@@ -101,19 +101,22 @@ from pathlib import Path
 import SimpleITK as sitk
 
 # ── CONFIG ────────────────────────────────────────────────────────
-IMG_SIZE   = 384   # 384×384 — good balance speed vs quality
-BATCH_SIZE = 8     # T4 16GB fits BS=8 at 384px with AMP
-ACCUM      = 3     # effective BS=24
+IMG_SIZE   = 384   # 384×384 — upgrade to 512 for upper-spine detail if VRAM allows
+BATCH_SIZE = 6     # T4 16GB: BS=6 at 384px leaves headroom; drop to 4 if OOM at 512
+ACCUM      = 4     # effective BS=24
 EPOCHS     = 300   # 300 epochs — need this many for 0.85+
 LR         = 4e-4  # slightly lower than 5e-4 — more stable
 LR_MIN     = 8e-6
 WARMUP_EP  = 10    # longer warmup
 WD         = 2e-4
-MAX_SPP    = 30
+MAX_SPP    = 30    # top-30 lumbar slices per patient
+RARE_SPP   = 15    # additional upper-spine slices sampled from top-20% of volume
 NC         = 19
 PATIENCE   = 80    # more patience — don't stop early
 SEED       = 42
-BASE_CH    = 40    # increased from 32 → bigger model → better features
+BASE_CH    = 48    # increased from 40 → 48: bigger model, ~40% more capacity
+USE_T1     = True  # also load T1 volumes — doubles training data
+torch.manual_seed(SEED); np.random.seed(SEED); random.seed(SEED)
 torch.manual_seed(SEED); np.random.seed(SEED); random.seed(SEED)
 torch.manual_seed(SEED); np.random.seed(SEED); random.seed(SEED)
 
@@ -166,7 +169,9 @@ def find_resume_ckpt():
         except: pass
     return best_path, best_ep
 
-print(f'Images: {IMAGES_DIR} ({len(mhas)} files)')
+t1_mhas = sorted([f for f in glob.glob('/kaggle/input/**/*_t1.mha', recursive=True)
+                  if 'SPACE' not in f]) if USE_T1 else []
+print(f'Images: {IMAGES_DIR} ({len(mhas)} T2 + {len(t1_mhas)} T1 files)')
 print(f'Masks : {MASKS_DIR}')
 
 # ── LABEL MAPPING ─────────────────────────────────────────────────
@@ -193,18 +198,24 @@ def load_vol(path):
 def fg(m): return float((m>0).sum())/max(m.size,1)
 
 # ── SPLITS ────────────────────────────────────────────────────────
-all_pids = sorted(set(Path(f).stem.replace('_t2','') for f in mhas
-                      if (MASKS_DIR/Path(f).name).exists()))
+# Collect all patient IDs from both T1 and T2 files
+all_t2_pids = sorted(set(Path(f).stem.replace('_t2','') for f in mhas
+                         if (MASKS_DIR/Path(f).name).exists()))
+all_t1_pids = sorted(set(Path(f).stem.replace('_t1','') for f in t1_mhas
+                         if (MASKS_DIR/Path(f).name.replace('_t1','_t2')).exists()
+                         or (MASKS_DIR/Path(f).name).exists())) if USE_T1 else []
+all_pids = sorted(set(all_t2_pids))  # split by patient (T1 and T2 same patient)
 random.Random(SEED).shuffle(all_pids)
 n_val    = max(1, len(all_pids)//5)
 va_pids  = all_pids[-n_val:]
 tr_pids  = all_pids[:-n_val]
-print(f'Patients: {len(tr_pids)} train | {len(va_pids)} val')
+print(f'Patients: {len(tr_pids)} train | {len(va_pids)} val '
+      f'(T2={len(all_t2_pids)}, T1={len(all_t1_pids)})')
 
 # ── CACHE ─────────────────────────────────────────────────────────
 def build_cache(pids, split):
     # Cache key includes IMG_SIZE so different resolutions get separate caches
-    cf = CACHE_DIR / f'{split}_t2_{IMG_SIZE}_v3.npz'
+    cf = CACHE_DIR / f'{split}_t2_{IMG_SIZE}_v4.npz'
     if cf.exists():
         print(f'  {split}: loading cache...', end=' ', flush=True)
         d = np.load(cf); t=time.time()
@@ -213,17 +224,27 @@ def build_cache(pids, split):
         return np.array(imgs,copy=True), np.array(msks,copy=True), rare
     print(f'  {split}: building cache ({len(pids)} patients)...')
     imgs, msks, rare = [], [], []
-    for i,pid in enumerate(pids):
-        ip=IMAGES_DIR/f'{pid}_t2.mha'; mp=MASKS_DIR/f'{pid}_t2.mha'
-        if not ip.exists() or not mp.exists(): continue
+
+    def _add_volume(ip, mp, pid_tag):
+        """Load one MHA pair and add its best slices."""
         try:
             iv=load_vol(ip).astype(np.float32)
             mv=load_vol(mp).astype(np.int32)
         except Exception as e:
-            print(f'  Error {pid}: {e}'); continue
-        n=iv.shape[0]; lo,hi=int(n*0.04),int(n*0.96)
+            print(f'  Error {pid_tag}: {e}'); return
+        n=iv.shape[0]
+
+        # ── Lumbar slices: bottom 80% sorted by foreground density ──
+        lo,hi=int(n*0.04),int(n*0.96)
         ranked=sorted(range(lo,hi),key=lambda s:fg(remap(mv[s])),reverse=True)[:MAX_SPP]
-        for s in ranked:
+
+        # ── Upper-spine slices: top 20% of volume (T10-T12 region) ──
+        # Sample evenly from the upper portion to ensure coverage
+        up_lo, up_hi = int(n*0.04), int(n*0.25)
+        upper_slices = list(range(up_lo, up_hi, max(1, (up_hi-up_lo)//RARE_SPP)))[:RARE_SPP]
+        all_slices   = sorted(set(ranked + upper_slices))
+
+        for s in all_slices:
             rm=remap(mv[s])
             if fg(rm)<0.003: continue
             p1,p99=np.percentile(iv[s],[0.5,99.5])
@@ -232,13 +253,26 @@ def build_cache(pids, split):
             mr=cv2.resize(rm.astype(np.float32),(IMG_SIZE,IMG_SIZE),
                           interpolation=cv2.INTER_NEAREST).astype(np.uint8)
             imgs.append(ir); msks.append(np.clip(mr,0,NC-1))
+            # Mark rare if upper-spine classes present (T10-T12, IVD 6-8)
             has_rare=any((rm==c).sum()/max(rm.size,1)>0.0003 for c in RARE)
-            rare.append(1.0 if has_rare else 0.1)
+            is_upper = s in upper_slices
+            rare.append(2.0 if (has_rare or is_upper) else 0.1)
+
+    for i,pid in enumerate(pids):
+        # T2 (primary)
+        ip=IMAGES_DIR/f'{pid}_t2.mha'; mp=MASKS_DIR/f'{pid}_t2.mha'
+        if ip.exists() and mp.exists():
+            _add_volume(ip, mp, f'{pid}_t2')
+        # T1 (additional data)
+        if USE_T1:
+            ip1=IMAGES_DIR/f'{pid}_t1.mha'; mp1=MASKS_DIR/f'{pid}_t1.mha'
+            # T1 mask may not exist — use T2 mask if paired
+            if not mp1.exists(): mp1 = MASKS_DIR/f'{pid}_t2.mha'
+            if ip1.exists() and mp1.exists():
+                _add_volume(ip1, mp1, f'{pid}_t1')
         if (i+1)%30==0: print(f'    {i+1}/{len(pids)}, {len(imgs)} slices')
     if not imgs:
         print(f'  ERROR: no slices for {split}! Sample pids: {pids[:3]}')
-        print(f'  Images dir: {IMAGES_DIR}')
-        print(f'  Sample file: {list(IMAGES_DIR.glob("*_t2.mha"))[:2]}')
         raise ValueError(f'No slices loaded for {split}')
     imgs_a=np.array(np.stack(imgs),dtype=np.float16,copy=True)
     msks_a=np.array(np.stack(msks),dtype=np.uint8,copy=True)
@@ -432,9 +466,9 @@ def get_lr(ep,start_ep):
     return LR_MIN+0.5*(LR-LR_MIN)*(1+np.cos(np.pi*t))
 
 # ── BUILD MODEL & DATALOADERS ─────────────────────────────────────
-model=ResUNet(b=BASE_CH,nc=NC,drop=0.20).to(device)  # b=40, less dropout
+model=ResUNet(b=BASE_CH,nc=NC,drop=0.18).to(device)  # b=48, slightly less dropout
 n_params=sum(p.numel() for p in model.parameters())
-print(f'\nModel: ResUNet+CBAM {n_params/1e6:.2f}M params')
+print(f'\nModel: ResUNet+CBAM {n_params/1e6:.2f}M params (base_ch={BASE_CH})')
 
 sampler=WeightedRandomSampler(torch.tensor(tr_rare),len(tr_rare),replacement=True)
 # num_workers=0 is critical on Kaggle — prevents DataLoader hang
@@ -444,7 +478,7 @@ print(f'Batches: {len(tr_dl)} train | {len(va_dl)} val')
 
 # ── RESUME OR START FRESH ─────────────────────────────────────────
 # Also copy cache from previous session if available
-for pattern in [f'/kaggle/input/**/*_t2_{IMG_SIZE}_v3.npz']:
+for pattern in [f'/kaggle/input/**/*_t2_{IMG_SIZE}_v4.npz']:
     for old_cache in glob.glob(pattern, recursive=True):
         dst = CACHE_DIR / Path(old_cache).name
         if not dst.exists():

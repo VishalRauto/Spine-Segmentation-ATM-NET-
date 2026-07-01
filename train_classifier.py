@@ -502,12 +502,13 @@ class ClassifierLoss(nn.Module):
         device = pred["disease_logits"].device
         cw = self.class_weights.to(device) if self.class_weights is not None else None
 
-        # Disease — weighted cross-entropy + label smoothing
-        dis_loss = F.cross_entropy(
-            pred["disease_logits"],
-            batch["disease_id"].to(device),
-            weight=cw, label_smoothing=0.1
-        )
+        # Disease — Focal Loss (gamma=2) + class weights to handle severe imbalance
+        logits = pred["disease_logits"]
+        targets = batch["disease_id"].to(device)
+        ce = F.cross_entropy(logits, targets, weight=cw, reduction='none')
+        pt = torch.exp(-ce)
+        dis_loss = ((1 - pt) ** 2 * ce).mean()   # focal gamma=2
+
         # Severity
         sev_loss = F.cross_entropy(
             pred["severity_logits"],
@@ -577,7 +578,7 @@ def train(args, device):
     train_weights = sample_weights[:n_train]
     sampler = WeightedRandomSampler(
         weights=train_weights,
-        num_samples=len(train_ds) * 3,   # 3× oversample each epoch
+        num_samples=len(train_ds) * 8,   # 8× oversample each epoch
         replacement=True,
     )
     train_dl = DataLoader(train_ds, batch_size=args.batch,
@@ -622,8 +623,23 @@ def train(args, device):
         tr_losses = defaultdict(float)
         for batch in train_dl:
             optimizer.zero_grad()
-            pred = model(batch["feat"].to(device))
-            loss, breakdown = criterion(pred, batch)
+            feat   = batch["feat"].to(device)
+            # Mixup augmentation — 50% of batches
+            if np.random.random() < 0.5 and len(feat) > 1:
+                lam  = float(np.random.beta(0.4, 0.4))
+                perm = torch.randperm(len(feat), device=device)
+                feat_mix = lam * feat + (1 - lam) * feat[perm]
+                pred = model(feat_mix)
+                loss_a, breakdown_a = criterion(pred, batch)
+                batch_b = {k: v[perm] if isinstance(v, torch.Tensor) else v
+                           for k, v in batch.items()}
+                loss_b, breakdown_b = criterion(pred, batch_b)
+                loss = lam * loss_a + (1 - lam) * loss_b
+                breakdown = {k: lam * breakdown_a[k] + (1-lam) * breakdown_b[k]
+                             for k in breakdown_a}
+            else:
+                pred = model(feat.to(device))
+                loss, breakdown = criterion(pred, batch)
             loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), 0.5)
             optimizer.step()
@@ -741,11 +757,11 @@ def patch_server(model: SpineClassifier):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--epochs",       type=int,   default=200)
-    parser.add_argument("--lr",           type=float, default=3e-4)
+    parser.add_argument("--epochs",       type=int,   default=300)
+    parser.add_argument("--lr",           type=float, default=1e-3)
     parser.add_argument("--batch",        type=int,   default=16)
-    parser.add_argument("--dropout",      type=float, default=0.5)
-    parser.add_argument("--patience",     type=int,   default=30,
+    parser.add_argument("--dropout",      type=float, default=0.3)
+    parser.add_argument("--patience",     type=int,   default=60,
                         help="Early stopping patience (val loss)")
     parser.add_argument("--max_patients", type=int,   default=None)
     parser.add_argument("--quick",        action="store_true",
