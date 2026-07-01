@@ -1,0 +1,8 @@
+{
+  "cv_mean_acc": 0.9219,
+  "cv_std_acc": 0.0191,
+  "best_fold_acc": 0.9318,
+  "rf_acc": 0.7478,
+  "feat_dim": 104,
+  "n_samples": 218
+}

@@ -58,6 +58,18 @@ desktop.ini
 # ── Upload dir (runtime) ─────────────────────────────────────────────
 uploads/
 
+# ── Model weights / binary artifacts (all output subdirs) ────────────
+outputs/**/*.pth
+outputs/**/*.pt
+outputs/**/*.npy
+outputs/**/*.npz
+outputs/classifier/
+outputs/fusion/
+outputs/gpu_run/
+outputs/high_perf_run/
+outputs/training_run/
+atmnet.db
+
 # ── Keep outputs structure but not binary files ───────────────────────
 !outputs/.gitkeep
 !checkpoints/.gitkeep

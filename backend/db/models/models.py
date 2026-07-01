@@ -19,9 +19,34 @@ from sqlalchemy import (
     Boolean, Column, DateTime, Float, ForeignKey,
     Integer, JSON, String, Text, Enum as SAEnum
 )
-from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.types import TypeDecorator, CHAR
+import sqlalchemy.dialects.postgresql as pg_types
 from sqlalchemy.orm import DeclarativeBase, relationship
 import enum
+
+
+# ── UUID type that works with both PostgreSQL and SQLite ──────────────
+class GUID(TypeDecorator):
+    """Platform-independent GUID type. Uses PostgreSQL UUID natively,
+    stores as CHAR(36) string on other backends (e.g. SQLite)."""
+    impl = CHAR
+    cache_ok = True
+
+    def load_dialect_impl(self, dialect):
+        if dialect.name == "postgresql":
+            return dialect.type_descriptor(pg_types.UUID())
+        return dialect.type_descriptor(CHAR(36))
+
+    def process_bind_param(self, value, dialect):
+        if value is None:
+            return None
+        return str(value)
+
+    def process_result_value(self, value, dialect):
+        if value is None:
+            return None
+        import uuid as _uuid
+        return _uuid.UUID(str(value))
 
 
 def utcnow():
@@ -75,7 +100,7 @@ class SeverityLevel(str, enum.Enum):
 class User(Base):
     __tablename__ = "users"
 
-    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    id = Column(GUID(), primary_key=True, default=uuid.uuid4)
     email = Column(String(255), unique=True, nullable=False, index=True)
     username = Column(String(100), unique=True, nullable=False, index=True)
     full_name = Column(String(255), nullable=True)
@@ -95,7 +120,7 @@ class User(Base):
 class Patient(Base):
     __tablename__ = "patients"
 
-    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    id = Column(GUID(), primary_key=True, default=uuid.uuid4)
     patient_code = Column(String(50), unique=True, nullable=False, index=True)
     first_name = Column(String(100), nullable=True)
     last_name = Column(String(100), nullable=True)
@@ -107,7 +132,7 @@ class Patient(Base):
     bmi = Column(Float, nullable=True)
     clinical_symptoms = Column(Text, nullable=True)
     medical_history = Column(JSON, nullable=True)
-    created_by = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=True)
+    created_by = Column(GUID(), ForeignKey("users.id"), nullable=True)
     created_at = Column(DateTime(timezone=True), default=utcnow)
     updated_at = Column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 
@@ -119,10 +144,10 @@ class Patient(Base):
 class Study(Base):
     __tablename__ = "studies"
 
-    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    id = Column(GUID(), primary_key=True, default=uuid.uuid4)
     study_uid = Column(String(100), unique=True, nullable=False, index=True)
-    patient_id = Column(UUID(as_uuid=True), ForeignKey("patients.id"), nullable=False)
-    created_by = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=True)
+    patient_id = Column(GUID(), ForeignKey("patients.id"), nullable=False)
+    created_by = Column(GUID(), ForeignKey("users.id"), nullable=True)
 
     # MRI metadata
     modality = Column(String(10), default="T2")
@@ -156,8 +181,8 @@ class Study(Base):
 class Prediction(Base):
     __tablename__ = "predictions"
 
-    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    study_id = Column(UUID(as_uuid=True), ForeignKey("studies.id"), nullable=False)
+    id = Column(GUID(), primary_key=True, default=uuid.uuid4)
+    study_id = Column(GUID(), ForeignKey("studies.id"), nullable=False)
 
     # Model info
     model_version = Column(String(50), default="1.0.0")
@@ -202,9 +227,9 @@ class Prediction(Base):
 class Report(Base):
     __tablename__ = "reports"
 
-    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    study_id = Column(UUID(as_uuid=True), ForeignKey("studies.id"), nullable=False)
-    prediction_id = Column(UUID(as_uuid=True), ForeignKey("predictions.id"), nullable=True)
+    id = Column(GUID(), primary_key=True, default=uuid.uuid4)
+    study_id = Column(GUID(), ForeignKey("studies.id"), nullable=False)
+    prediction_id = Column(GUID(), ForeignKey("predictions.id"), nullable=True)
 
     report_text = Column(Text, nullable=False)
     findings = Column(Text, nullable=True)
@@ -212,7 +237,7 @@ class Report(Base):
     recommendation = Column(Text, nullable=True)
     pdf_path = Column(String(500), nullable=True)
     is_reviewed = Column(Boolean, default=False)
-    reviewed_by = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=True)
+    reviewed_by = Column(GUID(), ForeignKey("users.id"), nullable=True)
     review_notes = Column(Text, nullable=True)
 
     created_at = Column(DateTime(timezone=True), default=utcnow)
@@ -225,8 +250,8 @@ class Report(Base):
 class AuditLog(Base):
     __tablename__ = "audit_logs"
 
-    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=True)
+    id = Column(GUID(), primary_key=True, default=uuid.uuid4)
+    user_id = Column(GUID(), ForeignKey("users.id"), nullable=True)
     action = Column(String(100), nullable=False)
     resource_type = Column(String(100), nullable=True)
     resource_id = Column(String(100), nullable=True)

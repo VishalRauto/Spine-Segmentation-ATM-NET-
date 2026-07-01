@@ -1,0 +1,184 @@
+{
+  "timestamp": "2026-06-22 20:13:32",
+  "total": 29,
+  "passed": 28,
+  "failed": 0,
+  "warned": 1,
+  "pass_pct": 97,
+  "results": [
+    {
+      "test": "Flask reachable",
+      "status": "PASS",
+      "detail": "HTTP 200",
+      "ms": 2136.19327545166
+    },
+    {
+      "test": "Flask /history",
+      "status": "PASS",
+      "detail": "HTTP 200",
+      "ms": 0
+    },
+    {
+      "test": "Flask predict [T2-1]",
+      "status": "PASS",
+      "detail": "disease=Disc Herniation | severity=Severe | pfirrmann=\u2014 | structures=4 | overlay=\u2713 | gradcam=\u2713 | BERT=\u2717 | ml_disease=Disc Herniation",
+      "ms": 6570.2667236328125
+    },
+    {
+      "test": "Flask predict [T2-2]",
+      "status": "PASS",
+      "detail": "disease=Disc Herniation | severity=Severe | pfirrmann=\u2014 | structures=13 | overlay=\u2713 | gradcam=\u2713 | BERT=\u2717 | ml_disease=Disc Herniation",
+      "ms": 5701.577186584473
+    },
+    {
+      "test": "Flask history",
+      "status": "PASS",
+      "detail": "39 records",
+      "ms": 0
+    },
+    {
+      "test": "Flask export CSV",
+      "status": "PASS",
+      "detail": "40 lines",
+      "ms": 0
+    },
+    {
+      "test": "Flask ICD-10",
+      "status": "PASS",
+      "detail": "3 codes for 'Disc Herniation'",
+      "ms": 0
+    },
+    {
+      "test": "Flask training history",
+      "status": "PASS",
+      "detail": "77 epochs | best_dice=\u2014",
+      "ms": 0
+    },
+    {
+      "test": "FastAPI /health",
+      "status": "PASS",
+      "detail": "status=healthy | cuda=True | device=cuda",
+      "ms": 2055.326461791992
+    },
+    {
+      "test": "FastAPI /docs",
+      "status": "PASS",
+      "detail": "HTTP 200",
+      "ms": 0
+    },
+    {
+      "test": "FastAPI OpenAPI schema",
+      "status": "PASS",
+      "detail": "17 routes registered",
+      "ms": 0
+    },
+    {
+      "test": "  Route /api/v1/auth/login",
+      "status": "PASS",
+      "detail": "present",
+      "ms": 0
+    },
+    {
+      "test": "  Route /api/v1/predict/upload-mri",
+      "status": "PASS",
+      "detail": "present",
+      "ms": 0
+    },
+    {
+      "test": "  Route /api/v1/patients",
+      "status": "PASS",
+      "detail": "present",
+      "ms": 0
+    },
+    {
+      "test": "  Route /api/v1/analytics/summary",
+      "status": "PASS",
+      "detail": "present",
+      "ms": 0
+    },
+    {
+      "test": "  Route /api/v1/reports/{report_id}",
+      "status": "PASS",
+      "detail": "present",
+      "ms": 0
+    },
+    {
+      "test": "FastAPI register",
+      "status": "PASS",
+      "detail": "id=2d550a99-6b3d-44ed-bc7a-e1e893f8134e | role=clinician",
+      "ms": 0
+    },
+    {
+      "test": "FastAPI login",
+      "status": "PASS",
+      "detail": "token=\u2713 | expires_in=3600s",
+      "ms": 0
+    },
+    {
+      "test": "FastAPI /me",
+      "status": "PASS",
+      "detail": "username=testuser_1782139373 | active=True",
+      "ms": 0
+    },
+    {
+      "test": "FastAPI create patient",
+      "status": "PASS",
+      "detail": "id=32fa318c-ae99-4440-bc9c-e3a799433e15 | bmi=None",
+      "ms": 0
+    },
+    {
+      "test": "FastAPI list patients",
+      "status": "PASS",
+      "detail": "3 patient(s)",
+      "ms": 0
+    },
+    {
+      "test": "FastAPI get patient",
+      "status": "PASS",
+      "detail": "name=John Doe",
+      "ms": 0
+    },
+    {
+      "test": "FastAPI predict [T2-1]",
+      "status": "PASS",
+      "detail": "disease=Disc Herniation(91.7%) | severity=Severe | pfirrmann=4.7 | structures=1 | levels=1 | overlay=\u2713 | gradcam=\u2713 | infer=3559.6ms",
+      "ms": 5717.32497215271
+    },
+    {
+      "test": "  Report text",
+      "status": "PASS",
+      "detail": "762 chars | impression='Disc Herniation \u2014 Severity: Severe. Pfirrmann: 4.7/5....'",
+      "ms": 0
+    },
+    {
+      "test": "FastAPI predict [T2-2]",
+      "status": "PASS",
+      "detail": "disease=Disc Herniation(90.2%) | severity=Severe | pfirrmann=4.6 | structures=2 | levels=1 | overlay=\u2713 | gradcam=\u2713 | infer=2523.6ms",
+      "ms": 4773.767709732056
+    },
+    {
+      "test": "  Report text",
+      "status": "PASS",
+      "detail": "808 chars | impression='Disc Herniation \u2014 Severity: Severe. Pfirrmann: 4.6/5....'",
+      "ms": 0
+    },
+    {
+      "test": "FastAPI analytics summary",
+      "status": "PASS",
+      "detail": "patients=3 | studies=0 | predictions=0 | avg_dice=None",
+      "ms": 0
+    },
+    {
+      "test": "FastAPI model performance",
+      "status": "PASS",
+      "detail": "HTTP 200",
+      "ms": 0
+    },
+    {
+      "test": "Dice Validation",
+      "status": "WARN",
+      "detail": "mean_dice=0.0001 over 2 cases",
+      "ms": 0
+    }
+  ]
+}

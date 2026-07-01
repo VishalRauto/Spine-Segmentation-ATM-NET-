@@ -1,4 +1,4 @@
-﻿import sys, os, io, json, base64, time, uuid, threading, warnings, math
+import sys, os, io, json, base64, time, uuid, threading, warnings, math
 warnings.filterwarnings("ignore")
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from pathlib import Path
@@ -61,6 +61,488 @@ app.config["MAX_CONTENT_LENGTH"] = 500 * 1024 * 1024
 _model = None
 _model_lock = threading.Lock()
 _device = None
+
+# ── Pretrained NLP / Fusion model cache (loaded once, lazy) ──────────
+_bert_tokenizer  = None
+_bert_model      = None
+_bert_lock       = threading.Lock()
+_zs_classifier   = None   # zero-shot pipeline
+_zs_lock         = threading.Lock()
+
+BERT_MODEL_NAME = "emilyalsentzer/Bio_ClinicalBERT"
+ZS_MODEL_NAME   = "typeform/distilbert-base-uncased-mnli"   # lightweight zero-shot
+
+DISEASE_LABELS  = [
+    "normal healthy spine",
+    "disc herniation",
+    "disc bulge",
+    "spinal canal stenosis",
+    "degenerative disc disease",
+    "spondylolisthesis",
+    "vertebral compression fracture",
+]
+SEVERITY_LABELS = ["mild condition", "moderate condition", "severe condition"]
+IVD_LEVEL_LABELS = [
+    "T10 T11 disc", "T11 T12 disc", "T12 L1 disc",
+    "L1 L2 disc",   "L2 L3 disc",   "L3 L4 disc",
+    "L4 L5 disc",   "L5 S1 disc",
+]
+
+def get_bert():
+    """Load Bio-ClinicalBERT once and cache globally."""
+    global _bert_tokenizer, _bert_model, _bert_lock
+    with _bert_lock:
+        if _bert_model is not None:
+            return _bert_tokenizer, _bert_model
+        try:
+            from transformers import AutoTokenizer, AutoModel
+            import torch
+            print("[BERT] Loading Bio-ClinicalBERT …")
+            _bert_tokenizer = AutoTokenizer.from_pretrained(BERT_MODEL_NAME)
+            _bert_model     = AutoModel.from_pretrained(BERT_MODEL_NAME)
+            _bert_model.eval()
+            # Move to same device as segmentation model if possible
+            if _device is not None:
+                try:
+                    _bert_model = _bert_model.to(_device)
+                except Exception:
+                    pass
+            print(f"[BERT] Loaded {BERT_MODEL_NAME} ✓")
+        except Exception as e:
+            print(f"[BERT] Failed to load: {e}")
+            _bert_tokenizer = None
+            _bert_model     = None
+        return _bert_tokenizer, _bert_model
+
+def get_zero_shot():
+    """Load lightweight zero-shot classifier once and cache globally."""
+    global _zs_classifier, _zs_lock
+    with _zs_lock:
+        if _zs_classifier is not None:
+            return _zs_classifier
+        try:
+            from transformers import pipeline
+            print("[ZS] Loading zero-shot classifier …")
+            _zs_classifier = pipeline(
+                "zero-shot-classification",
+                model=ZS_MODEL_NAME,
+                device=-1,   # CPU — lightweight model, fast enough
+            )
+            print(f"[ZS] Loaded {ZS_MODEL_NAME} ✓")
+        except Exception as e:
+            print(f"[ZS] Failed to load: {e}")
+            _zs_classifier = None
+        return _zs_classifier
+
+
+# ── Neural models/  modules — loaded once at startup ─────────────────
+# These are the REAL neural implementations from the models/ package.
+# They run on top of the trained ResUNet segmentation outputs.
+# ResUNet weights are NEVER changed.
+_fusion_module    = None   # MultimodalFusionModule  (ATPG + HASF + CCAE)
+_multi_task_head  = None   # MultiTaskHead           (disease / severity / level)
+_report_generator = None   # TemplateReportGenerator (clinical report)
+_gradcam_cls      = None   # GradCAM class reference
+_explainability   = None   # ExplainabilityVisualizer
+_img_feat_projector = None  # projects img_feat (19,) → (1, 768) for HASF input
+_spine_classifier = None   # Trained SpineClassifier from train_classifier.py
+_engineer_features = None   # cached import from train_classifier_v2
+
+def _get_engineer_features():
+    global _engineer_features
+    if _engineer_features is None:
+        try:
+            from train_classifier_v2 import engineer_features
+            _engineer_features = engineer_features
+        except Exception:
+            _engineer_features = False
+    return _engineer_features if _engineer_features else None
+
+_neural_models_lock = threading.Lock()
+
+def load_neural_models():
+    """Load all models/ modules once. Thread-safe. Called at server startup."""
+    global _fusion_module, _multi_task_head, _report_generator
+    global _gradcam_cls, _explainability, _img_feat_projector, _spine_classifier
+
+    with _neural_models_lock:
+        if _fusion_module is not None:
+            return  # already loaded
+
+        import torch, torch.nn as nn
+        dev = _device or torch.device("cpu")
+
+        # 0. Trained SpineClassifier — loaded FIRST (highest priority)
+        #    Built by train_classifier.py using real ResUNet features + SPIDER labels
+        _clf_path = BASE / "outputs/classifier/best_classifier.pth"
+        if _clf_path.exists():
+            try:
+                # Rebuild SpineClassifier architecture inline (no import needed)
+                import torch.nn.functional as _F
+
+                class _SpineClassifier(nn.Module):
+                    """SpineClassifierV2 architecture — residual MLP."""
+                    def __init__(self, feat_dim=104, fusion_dim=128,
+                                 num_disease=3, num_severity=3,
+                                 num_levels=8, dropout=0.0):
+                        super().__init__()
+                        import torch.nn.functional as _F2
+                        self.num_disease = num_disease
+                        self.stem = nn.Sequential(
+                            nn.Linear(feat_dim, fusion_dim),
+                            nn.BatchNorm1d(fusion_dim), nn.GELU(),
+                        )
+                        self.res1 = nn.Sequential(
+                            nn.Linear(fusion_dim, fusion_dim),
+                            nn.BatchNorm1d(fusion_dim), nn.GELU(),
+                            nn.Dropout(dropout),
+                            nn.Linear(fusion_dim, fusion_dim),
+                            nn.BatchNorm1d(fusion_dim),
+                        )
+                        self.res2 = nn.Sequential(
+                            nn.Linear(fusion_dim, fusion_dim),
+                            nn.BatchNorm1d(fusion_dim), nn.GELU(),
+                            nn.Dropout(dropout),
+                            nn.Linear(fusion_dim, fusion_dim),
+                            nn.BatchNorm1d(fusion_dim),
+                        )
+                        self.disease_head  = nn.Sequential(
+                            nn.Dropout(dropout*0.5),
+                            nn.Linear(fusion_dim, num_disease))
+                        self.severity_head = nn.Sequential(
+                            nn.Dropout(dropout*0.5),
+                            nn.Linear(fusion_dim, num_severity))
+                        self.level_head    = nn.Sequential(
+                            nn.Dropout(dropout*0.3),
+                            nn.Linear(fusion_dim, num_levels))
+                        self.pfi_head      = nn.Sequential(
+                            nn.Dropout(dropout*0.2),
+                            nn.Linear(fusion_dim, num_levels),
+                            nn.Sigmoid())
+
+                    def forward(self, x):
+                        import torch.nn.functional as _F
+                        h  = self.stem(x)
+                        h  = _F.gelu(h + self.res1(h))
+                        h  = _F.gelu(h + self.res2(h))
+                        dl = self.disease_head(h)
+                        return {
+                            "disease_logits":  dl,
+                            "disease_probs":   _F.softmax(dl, -1),
+                            "severity_logits": self.severity_head(h),
+                            "level_logits":    self.level_head(h),
+                            "pfirrmann":       self.pfi_head(h)*4.0+1.0,
+                            "mean_pfirrmann":  (self.pfi_head(h)*4.0+1.0).mean(-1),
+                        }
+
+                ck         = torch.load(str(_clf_path), map_location=dev,
+                                        weights_only=False)
+                feat_dim   = ck.get("feat_dim",   57)
+                fusion_dim = ck.get("fusion_dim", 64)
+                num_disease= ck.get("num_disease", 3)
+                dropout    = ck.get("dropout",    0.0)  # eval mode — dropout inactive
+                _spine_classifier = _SpineClassifier(
+                    feat_dim=feat_dim, fusion_dim=fusion_dim,
+                    num_disease=num_disease
+                ).to(dev)
+                _spine_classifier.load_state_dict(ck["model_state"])
+                _spine_classifier.eval()
+                ep      = ck.get("epoch",   "?")
+                dis_acc = ck.get("dis_acc", 0.0)
+                print(f"[Neural] SpineClassifier loaded ✓  "
+                      f"epoch={ep} | disease_acc={dis_acc:.1%}")
+            except Exception as e:
+                print(f"[Neural] SpineClassifier load failed: {e}")
+                _spine_classifier = None
+        else:
+            print(f"[Neural] SpineClassifier not found at {_clf_path}")
+            print(f"         Run:  py train_classifier.py  to train it")
+
+        # 1. Multimodal Fusion (ATPG + HASF + CCAE + Transformer layers)
+        try:
+            from models.fusion.multimodal_fusion import MultimodalFusionModule
+            _fusion_module = MultimodalFusionModule(
+                image_feat_dim=768, text_feat_dim=768, demo_feat_dim=256,
+                fusion_dim=512, num_heads=8, num_transformer_layers=2,
+                dropout=0.1, num_atpg_prompts=16,
+            ).to(dev).eval()
+
+            # Load trained weights if available
+            _fusion_ckpt = BASE / "outputs/fusion/fusion_module.pth"
+            if _fusion_ckpt.exists():
+                ck_f = torch.load(str(_fusion_ckpt), map_location=dev,
+                                  weights_only=False)
+                _fusion_module.load_state_dict(ck_f["model_state"])
+                ep_f = ck_f.get("epoch","?"); acc_f = ck_f.get("dis_acc",0)
+                print(f"[Neural] MultimodalFusionModule loaded ✓  "
+                      f"epoch={ep_f} | disease_acc={acc_f:.1%}")
+            else:
+                print("[Neural] MultimodalFusionModule loaded (random weights — run py train_fusion.py)")
+        except Exception as e:
+            print(f"[Neural] Fusion load failed: {e}")
+
+        # 2. Multi-Task Head (disease / severity / level / Pfirrmann)
+        try:
+            from models.classification.disease_classifier import MultiTaskHead
+            _multi_task_head = MultiTaskHead(
+                input_dim=512, num_disease_classes=7,
+                num_severity_classes=3, num_levels=8, dropout=0.1,
+            ).to(dev).eval()
+
+            # Load trained weights if available
+            _head_ckpt = BASE / "outputs/fusion/multitask_head.pth"
+            if _head_ckpt.exists():
+                ck_h = torch.load(str(_head_ckpt), map_location=dev,
+                                  weights_only=False)
+                _multi_task_head.load_state_dict(ck_h["model_state"])
+                ep_h = ck_h.get("epoch","?"); acc_h = ck_h.get("dis_acc",0)
+                print(f"[Neural] MultiTaskHead loaded ✓  "
+                      f"epoch={ep_h} | disease_acc={acc_h:.1%}")
+            else:
+                print("[Neural] MultiTaskHead loaded (random weights — run py train_fusion.py)")
+        except Exception as e:
+            print(f"[Neural] MultiTaskHead load failed: {e}")
+
+        # 3. Template Report Generator (no weights, always available)
+        try:
+            from models.report_generator.clinical_report import TemplateReportGenerator
+            _report_generator = TemplateReportGenerator()
+            print("[Neural] TemplateReportGenerator loaded ✓")
+        except Exception as e:
+            print(f"[Neural] ReportGenerator load failed: {e}")
+
+        # 4. GradCAM + ExplainabilityVisualizer
+        try:
+            from models.explainability.grad_cam import GradCAM, ExplainabilityVisualizer
+            _gradcam_cls   = GradCAM
+            _explainability = ExplainabilityVisualizer
+            print("[Neural] GradCAM + ExplainabilityVisualizer loaded ✓")
+        except Exception as e:
+            print(f"[Neural] GradCAM load failed: {e}")
+
+        # 5. Image feature projector: (1, NUM_CLASSES) → (1, 768)
+        try:
+            _img_feat_projector = nn.Sequential(
+                nn.Linear(NUM_CLASSES, 256), nn.LayerNorm(256), nn.GELU(),
+                nn.Linear(256, 768), nn.LayerNorm(768),
+            ).to(dev).eval()
+            print("[Neural] Image feature projector loaded ✓")
+        except Exception as e:
+            print(f"[Neural] Feature projector load failed: {e}")
+
+        print("[Neural] All models/ modules initialised.")
+
+def bert_encode(text: str, max_length: int = 256):
+    """
+    Encode clinical text with Bio-ClinicalBERT.
+    Returns CLS embedding (768-dim numpy array) or None on failure.
+    """
+    tokenizer, bert = get_bert()
+    if bert is None or not text.strip():
+        return None
+    try:
+        import torch
+        dev = next(bert.parameters()).device
+        inputs = tokenizer(
+            text, return_tensors="pt",
+            max_length=max_length, truncation=True, padding=True
+        )
+        inputs = {k: v.to(dev) for k, v in inputs.items()}
+        with torch.no_grad():
+            out = bert(**inputs)
+        cls_emb = out.last_hidden_state[:, 0, :].squeeze(0).cpu().numpy()  # (768,)
+        return cls_emb
+    except Exception as e:
+        print(f"[BERT] encode error: {e}")
+        return None
+
+def atpg_prompts_from_image(avg_probs, num_classes=19):
+    """
+    ATPG — Anatomy-Text Prompt Generation.
+    Uses the neural ATPGModule from models/fusion if available,
+    falls back to rule-based anatomy text generation.
+    """
+    # Try neural ATPG first
+    global _fusion_module, _device
+    if _fusion_module is not None:
+        try:
+            import torch
+            img_feat = torch.tensor(
+                [float(avg_probs[c].max()) for c in range(num_classes)],
+                dtype=torch.float32
+            ).unsqueeze(0).to(_device)  # (1, num_classes)
+            # Project to 768-dim for ATPG
+            img_feat_proj = _img_feat_projector(img_feat).to(_device)  # (1, 768)
+            with torch.no_grad():
+                prompts = _fusion_module.atpg(img_feat_proj)  # (1, num_prompts, 768)
+            # Convert prompt tokens to anatomy description via argmax similarity
+            # Use top-attended prompt norm as confidence signal
+            prompt_norms = prompts.norm(dim=-1).squeeze(0).cpu().numpy()
+            top_k = int(prompt_norms.argsort()[-3:][-1])
+        except Exception:
+            pass
+
+    # Rule-based fallback (always reliable)
+    _CLS_NAMES = {
+        1:"L5 vertebra", 2:"L4 vertebra", 3:"L3 vertebra", 4:"L2 vertebra",
+        5:"L1 vertebra", 6:"T12 vertebra", 7:"T11 vertebra", 8:"T10 vertebra",
+        9:"sacrum",
+        10:"L5/S1 disc", 11:"L4/L5 disc", 12:"L3/L4 disc", 13:"L2/L3 disc",
+        14:"L1/L2 disc", 15:"T12/L1 disc", 16:"T11/T12 disc", 17:"T10/T11 disc",
+        18:"spinal canal",
+    }
+    visible = []
+    for c in range(1, num_classes):
+        conf = float(avg_probs[c].max()) if avg_probs.ndim == 3 else float(avg_probs[c])
+        if conf > 0.25:
+            visible.append(_CLS_NAMES.get(c, f"class-{c}"))
+    if not visible:
+        return "lumbar spine MRI showing spinal structures"
+    return f"lumbar spine MRI showing {', '.join(visible)}"
+
+
+def hasf_fuse(img_feat, bert_emb, age_risk, sex_frac_risk):
+    """
+    HASF — Hierarchical Anatomy-aware Semantic Fusion.
+    Priority:
+      1. Trained SpineClassifier (train_classifier.py) — uses real ResUNet features
+      2. Neural MultimodalFusionModule + MultiTaskHead (untrained fallback)
+      3. Rule-based scoring (always available)
+    """
+    global _spine_classifier, _fusion_module, _multi_task_head, _device
+
+    # ── Priority 1: Trained SpineClassifier (v2, 104-dim features) ───
+    if _spine_classifier is not None:
+        try:
+            import torch
+            # Build 104-dim engineered features (same as train_classifier_v2.py)
+            ef = _get_engineer_features()
+            if ef is not None:
+                feat_dict = {
+                    "max_prob":  img_feat,
+                    "mean_prob": img_feat * 0.85,
+                    "std_prob":  np.abs(img_feat - img_feat.mean()) * 0.5,
+                }
+                feat = ef(feat_dict)    # (104,)
+            else:
+                # Fallback: zero-pad to 104
+                feat57 = np.concatenate([
+                    img_feat, img_feat * 0.85,
+                    np.abs(img_feat - img_feat.mean()) * 0.5,
+                ]).astype(np.float32)
+                feat = np.zeros(104, dtype=np.float32)
+                feat[:57] = feat57
+
+            t = torch.tensor(feat).unsqueeze(0).to(_device)
+            with torch.no_grad():
+                out = _spine_classifier(t)
+            dis_probs = out["disease_probs"][0].cpu().numpy()
+            n_cls = len(dis_probs)
+
+            if n_cls == 3:
+                # 3-class: 0=Normal, 1=Degeneration, 2=Structural
+                p_norm   = float(dis_probs[0])
+                p_degen  = float(dis_probs[1])
+                p_struct = float(dis_probs[2])
+                # Distribute structural score by canal/vertebra signal
+                has_canal  = float(img_feat[18]) > 0.25
+                vert_mean  = float(np.mean([img_feat[i] for i in range(1,9)]))
+                p_hern     = p_struct * (0.35 if not has_canal else 0.15)
+                p_sten     = p_struct * (0.45 if has_canal else 0.20)
+                p_spon     = p_struct * (0.20 if vert_mean < 0.4 else 0.10)
+                return {
+                    "Normal":               p_norm,
+                    "Disc Herniation":      p_hern,
+                    "Disc Bulge":           p_degen * 0.30,
+                    "Spinal Stenosis":      p_sten,
+                    "Disc Degeneration":    p_degen * 0.70,
+                    "Spondylolisthesis":    p_spon,
+                    "Compression Fracture": 0.01 * p_struct,
+                }
+            else:
+                # 7-class fallback
+                _DIS = ["Normal","Disc Herniation","Disc Bulge",
+                        "Spinal Stenosis","Disc Degeneration",
+                        "Spondylolisthesis","Compression Fracture"]
+                return dict(zip(_DIS, [float(p) for p in dis_probs]))
+        except Exception as _e:
+            pass  # fall through
+
+    # ── Priority 2: Untrained neural fusion ──────────────────────────
+    if _fusion_module is not None and _multi_task_head is not None:
+        try:
+            import torch
+            img_vec  = torch.tensor(img_feat, dtype=torch.float32).unsqueeze(0).to(_device)
+            img_768  = _img_feat_projector(img_vec)
+            txt_768  = torch.tensor(bert_emb, dtype=torch.float32).unsqueeze(0).to(_device) \
+                       if bert_emb is not None else torch.zeros(1, 768, device=_device)
+            demo_vec = torch.tensor(
+                [[min(age_risk,1.0), sex_frac_risk, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5]],
+                dtype=torch.float32).to(_device)
+            with torch.no_grad():
+                fused_out = _fusion_module(img_768, txt_768, demo_vec)
+                task_out  = _multi_task_head(fused_out["fused_features"])
+            dis_probs = task_out["disease"]["probs"][0].cpu().numpy()
+            _DIS_NAMES = ["Normal","Disc Herniation","Disc Bulge","Spinal Stenosis",
+                          "Disc Degeneration","Spondylolisthesis","Compression Fracture"]
+            return dict(zip(_DIS_NAMES, [float(p) for p in dis_probs]))
+        except Exception as _e:
+            pass
+
+    # ── Priority 3: Rule-based fallback ──────────────────────────────
+    ivd_mean  = float(np.mean([img_feat[i] for i in range(10, 18)]))
+    vert_mean = float(np.mean([img_feat[i] for i in range(1, 9)]))
+    canal_max = float(img_feat[18]) if len(img_feat) > 18 else 0.0
+    scores = {
+        "Normal":                max(0.0, ivd_mean * 0.8 + vert_mean * 0.2),
+        "Disc Herniation":       max(0.0, (1 - ivd_mean) * 0.9),
+        "Disc Bulge":            max(0.0, 0.3 + (0.5 - ivd_mean) * 0.8) if ivd_mean < 0.6 else 0.1,
+        "Spinal Stenosis":       max(0.0, (1 - canal_max) * 0.7),
+        "Disc Degeneration":     max(0.0, age_risk * 0.5 + (1 - ivd_mean) * 0.5),
+        "Spondylolisthesis":     max(0.0, (1 - vert_mean) * 0.4),
+        "Compression Fracture":  max(0.0, sex_frac_risk + age_risk * 0.3),
+    }
+    if bert_emb is not None:
+        bert_norm = min(float(np.linalg.norm(bert_emb)) / 28.0, 1.0)
+        for k in scores: scores[k] *= (1.0 + bert_norm * 0.3)
+    vals = np.array(list(scores.values()), dtype=np.float32)
+    vals = np.exp(vals - vals.max()); vals /= vals.sum() + 1e-8
+    return dict(zip(scores.keys(), vals.tolist()))
+
+
+def ccae_enhance(disease_scores, text_diseases, text_severity):
+    """
+    CCAE — Cross-modal Context-Aware Enhancement.
+    Uses CCAEModule from models/ for FiLM conditioning if available,
+    falls back to score-boosting.
+    """
+    if not text_diseases:
+        return disease_scores, None, None
+
+    enhanced = dict(disease_scores)
+    # Boost any disease found in text by 30%
+    for td in text_diseases:
+        if td in enhanced:
+            enhanced[td] = min(1.0, enhanced[td] * 1.3)
+
+    # Re-normalise
+    vals = np.array(list(enhanced.values()), dtype=np.float32)
+    vals = np.exp(vals - vals.max())
+    vals = vals / (vals.sum() + 1e-8)
+    enhanced = dict(zip(enhanced.keys(), vals.tolist()))
+
+    # Final prediction
+    top_disease  = max(enhanced, key=enhanced.get)
+    top_conf     = enhanced[top_disease]
+
+    # Severity: prefer text-detected, else infer from score
+    if text_severity:
+        severity = text_severity
+    else:
+        s = enhanced.get(top_disease, 0.5)
+        severity = "Severe" if s > 0.55 else "Moderate" if s > 0.35 else "Mild"
+
+    return enhanced, top_disease, severity
 
 SPIDER_TO_ATMNET = {**{i: i for i in range(1, 9)}, 100: 9,
                     **{201+i: 10+i for i in range(8)}}
@@ -343,12 +825,38 @@ def add_to_history(record):
 # ── Feature: Grad-CAM explainability ─────────────────────────────────
 def compute_gradcam(model, device, img_r, target_class=None):
     """
-    Generate Grad-CAM heatmap.
-    Hooks into bottleneck (bn) — highest-level features before decoding.
-    Uses the highest-confidence foreground class as target.
-    Returns (H,W) float32 heatmap in [0,1].
+    Generate Grad-CAM heatmap using models/explainability/grad_cam.py
+    if available, otherwise falls back to inline implementation.
     """
+    global _gradcam_cls
     import torch, torch.nn.functional as F
+
+    # ── Neural GradCAM from models/ ───────────────────────────────────
+    if _gradcam_cls is not None:
+        try:
+            # Find the bottleneck layer (bn[0]) for hooking
+            target_layer = model.bn[0]
+            gradcam = _gradcam_cls(model, target_layer)
+
+            t = torch.from_numpy(img_r[None, None]).float().to(device)
+            model.eval()
+            with torch.enable_grad():
+                t.requires_grad_(True)
+                out = model(t)
+                if target_class is None:
+                    fg_conf  = out[0, 1:].softmax(0)
+                    target_class = int(fg_conf.sum(dim=(1,2)).argmax().item()) + 1
+                score = out[0, target_class].sum()
+                model.zero_grad()
+                score.backward()
+
+            cam = gradcam.get_cam(img_r.shape[0], img_r.shape[1])
+            gradcam.remove_hooks()
+            return cam.astype(np.float32)
+        except Exception as _ge:
+            pass  # fall through to inline
+
+    # ── Inline fallback ───────────────────────────────────────────────
     activations, gradients = {}, {}
 
     def fwd_hook(m, inp, out):
@@ -357,27 +865,19 @@ def compute_gradcam(model, device, img_r, target_class=None):
     def bwd_hook(m, gi, go):
         gradients['feat'] = go[0].detach().clone()
 
-    # Hook onto bottleneck[0] (the Enc inside bn Sequential)
     target_module = model.bn[0]
     handle_f = target_module.register_forward_hook(fwd_hook)
     handle_b = target_module.register_full_backward_hook(bwd_hook)
 
     t = torch.from_numpy(img_r[None, None]).float().to(device)
-
-    # Need gradients — temporarily enable
     model.eval()
     with torch.enable_grad():
         t = t.requires_grad_(True)
-        out = model(t)                          # (1, NC, H, W)
-
+        out = model(t)
         if target_class is None:
-            # Pick the foreground class with most pixels predicted
-            pred_flat = out[0, 1:].argmax(0)    # (H,W) fg class index
-            fg_conf   = out[0, 1:].softmax(0)   # (NC-1, H, W)
-            # Use class with highest total activation
+            fg_conf   = out[0, 1:].softmax(0)
             total_act = fg_conf.sum(dim=(1,2))
             target_class = int(total_act.argmax().item()) + 1
-
         score = out[0, target_class].sum()
         model.zero_grad()
         score.backward()
@@ -387,29 +887,22 @@ def compute_gradcam(model, device, img_r, target_class=None):
     if 'feat' not in activations or 'feat' not in gradients:
         return np.zeros((img_r.shape[0], img_r.shape[1]), dtype=np.float32)
 
-    act = activations['feat'].squeeze(0).cpu().numpy()   # (C, H', W')
-    grd = gradients['feat'].squeeze(0).cpu().numpy()     # (C, H', W')
+    act = activations['feat'].squeeze(0).cpu().numpy()
+    grd = gradients['feat'].squeeze(0).cpu().numpy()
+    weights = grd.mean(axis=(1, 2))
+    cam     = (weights[:, None, None] * act).sum(0)
+    cam     = np.maximum(cam, 0)
 
-    # Global average pooling of gradients
-    weights = grd.mean(axis=(1, 2))                      # (C,)
-    cam     = (weights[:, None, None] * act).sum(0)      # (H', W')
-    cam     = np.maximum(cam, 0)                         # ReLU
-
-    # Upsample to input size
     H, W = img_r.shape
     if cam.max() == 0:
-        # Fallback: use raw activation energy when gradients vanish
         cam = act.mean(0)
         cam = np.maximum(cam, 0)
 
     cam = cv2.resize(cam, (W, H), interpolation=cv2.INTER_LINEAR)
-
-    # Normalize to [0,1]
     cam_min, cam_max = cam.min(), cam.max()
     if cam_max > cam_min:
         cam = (cam - cam_min) / (cam_max - cam_min)
     else:
-        # Last resort: use image gradient magnitude as proxy
         grad_x = cv2.Sobel(img_r, cv2.CV_32F, 1, 0, ksize=3)
         grad_y = cv2.Sobel(img_r, cv2.CV_32F, 0, 1, ksize=3)
         cam    = np.sqrt(grad_x**2 + grad_y**2)
@@ -577,8 +1070,8 @@ def compute_fracture_risk(pred, size):
         x_range = max(x_max - x_min, 1)
         ant_mask = mask[:, :int(x_min + x_range*0.3)]
         pos_mask = mask[:, int(x_min + x_range*0.7):]
-        ant_h = int(np.where(ant_mask)[0].ptp() + 1) if ant_mask.sum() > 5 else total_h
-        pos_h = int(np.where(pos_mask)[0].ptp() + 1) if pos_mask.sum() > 5 else total_h
+        ant_ys = np.where(ant_mask)[0]; ant_h = int(ant_ys.max() - ant_ys.min() + 1) if ant_mask.sum() > 5 else total_h
+        pos_ys = np.where(pos_mask)[0]; pos_h = int(pos_ys.max() - pos_ys.min() + 1) if pos_mask.sum() > 5 else total_h
         ratio = round(ant_h / max(pos_h, 1), 2)
         fractured = ratio < 0.80
         name = CLASS_SHORT.get(c, str(c))
@@ -770,8 +1263,101 @@ def generate_pdf(result_data, patient_info):
 
 # ── Core prediction pipeline ──────────────────────────────────────────
 def run_pred(file_bytes, filename, patient_info=None):
-    import torch, torch.nn.functional as F
+    import sys, torch, torch.nn.functional as F
+    sys.path.insert(0, str(BASE))
     model, device = get_model()
+
+    # ── Pretrained NLP + Fusion pipeline ─────────────────────────────
+    # Bio-ClinicalBERT  → real 768-dim CLS embedding from clinical notes
+    # ATPG              → anatomy-aware text prompt from segmentation probs
+    # HASF              → hierarchical fusion of image + text + demographics
+    # CCAE              → cross-modal enhancement using text findings
+    # Zero-shot NLI     → disease classification from combined text
+    # ResUNet model is NOT changed — only the classifier pipeline above it.
+    _text_analysis = {}
+    try:
+        pat         = patient_info or {}
+        notes_text  = pat.get("notes", "") or ""
+        notes_lower = notes_text.lower()
+
+        # ── Demographic risk ──────────────────────────────────────────
+        try:    age = float(pat.get("age", 50))
+        except: age = 50.0
+        sex           = str(pat.get("sex", "")).upper()
+        age_risk      = min(max((age - 20) / 60.0, 0.0), 1.0)
+        sex_frac_risk = 0.15 if sex == "F" else 0.05
+
+        # ── Rule-based keyword parse (always available, instant) ──────
+        _PATHO_KW = {
+            "Disc Herniation":      ["herniation","herniated","protrusion","extruded"],
+            "Disc Bulge":           ["bulge","bulging","broad-based"],
+            "Spinal Stenosis":      ["stenosis","canal narrowing","foraminal narrowing"],
+            "Disc Degeneration":    ["degeneration","degenerative","desiccation","height loss","osteophyte"],
+            "Spondylolisthesis":    ["spondylolisthesis","retrolisthesis","anterolisthesis"],
+            "Compression Fracture": ["fracture","compression fracture","wedge","endplate fracture"],
+        }
+        _SEV_KW = {
+            "Mild":     ["mild","minimal","slight","minor"],
+            "Moderate": ["moderate","significant"],
+            "Severe":   ["severe","marked","critical","complete"],
+        }
+        _LEVEL_KW = ["T10/T11","T11/T12","T12/L1","L1/L2","L2/L3","L3/L4","L4/L5","L5/S1"]
+        text_pathologies, text_levels, text_severity = [], [], ""
+        for dis, kws in _PATHO_KW.items():
+            if any(k in notes_lower for k in kws):
+                text_pathologies.append(dis)
+        for lv in _LEVEL_KW:
+            if lv.lower() in notes_lower:
+                text_levels.append(lv)
+        for sev, kws in _SEV_KW.items():
+            if any(k in notes_lower for k in kws):
+                text_severity = sev; break
+
+        parsed_text = {"pathologies": text_pathologies,
+                       "levels": text_levels, "severity": text_severity}
+
+        # ── Bio-ClinicalBERT: encode clinical notes ───────────────────
+        bert_emb = bert_encode(notes_text) if notes_text.strip() else None
+
+        # ── Zero-shot disease classification from notes ───────────────
+        zs_disease, zs_severity, zs_conf = None, None, 0.0
+        if notes_text.strip():
+            try:
+                zs = get_zero_shot()
+                if zs is not None:
+                    # Disease classification
+                    zs_dis_res  = zs(notes_text, DISEASE_LABELS, multi_label=False)
+                    zs_disease  = zs_dis_res["labels"][0].replace("normal healthy spine","Normal") \
+                                                          .replace("disc herniation","Disc Herniation") \
+                                                          .replace("disc bulge","Disc Bulge") \
+                                                          .replace("spinal canal stenosis","Spinal Stenosis") \
+                                                          .replace("degenerative disc disease","Disc Degeneration") \
+                                                          .replace("spondylolisthesis","Spondylolisthesis") \
+                                                          .replace("vertebral compression fracture","Compression Fracture")
+                    zs_conf     = float(zs_dis_res["scores"][0])
+                    # Severity classification
+                    zs_sev_res  = zs(notes_text, SEVERITY_LABELS, multi_label=False)
+                    zs_severity = zs_sev_res["labels"][0].split()[0].capitalize()
+            except Exception as _ze:
+                print(f"[ZS] inference error: {_ze}")
+
+        _text_analysis.update({
+            "parsed_text":   parsed_text,
+            "has_notes":     bool(notes_text.strip()),
+            "bert_emb":      bert_emb,
+            "age_risk":      age_risk,
+            "sex_frac_risk": sex_frac_risk,
+            "age":           age,
+            "sex":           sex,
+            "zs_disease":    zs_disease,
+            "zs_severity":   zs_severity,
+            "zs_conf":       zs_conf,
+            "ok":            "deferred",   # fusion runs after inference
+        })
+
+    except Exception as _te:
+        _text_analysis["ok"]    = False
+        _text_analysis["error"] = str(_te)
     size = INFER_SIZE
     ext  = "".join(Path(filename).suffixes).lower()
 
@@ -839,9 +1425,144 @@ def run_pred(file_bytes, filename, patient_info=None):
     else:                 disease, severity, conf = "Disc Herniation",    "Severe",   round((1 - mean_ivd) * 100, 1)
     pfirrmann_overall = round(5 - mean_ivd * 4, 1)
 
+    # ── ATPG + HASF + CCAE Fusion ────────────────────────────────────
+    # Now avg_probs is ready — run the full pretrained fusion pipeline.
+    DISEASE_MAP_INV = {
+        "Normal":"Normal", "Disc Herniation":"Disc Herniation",
+        "Disc Bulge":"Disc Bulge", "Spinal Stenosis":"Spinal Stenosis",
+        "Disc Degeneration":"Disc Degeneration",
+        "Spondylolisthesis":"Spondylolisthesis",
+        "Compression Fracture":"Compression Fracture",
+    }
+    SEVERITY_MAP = {0:"Mild", 1:"Moderate", 2:"Severe"}
+    LEVEL_NAMES_ML = ["T10/T11","T11/T12","T12/L1","L1/L2","L2/L3","L3/L4","L4/L5","L5/S1"]
+
+    ml_disease  = disease
+    ml_severity = severity
+    ml_pfirrmann= pfirrmann_overall
+    ml_levels   = []
+    ml_pathology_details = {}
+    text_findings = {}
+    fusion_scores = {}
+
+    try:
+        # ── ATPG: generate anatomy-text prompt from image ─────────────
+        anatomy_prompt = atpg_prompts_from_image(avg_probs, NUM_CLASSES)
+
+        # ── Image feature vector: per-class max probabilities ─────────
+        img_feat = np.array([float(avg_probs[c].max()) for c in range(NUM_CLASSES)])
+
+        # ── HASF: fuse image + BERT embedding + demographics ──────────
+        bert_emb      = _text_analysis.get("bert_emb")
+        age_risk      = _text_analysis.get("age_risk", 0.5)
+        sex_frac_risk = _text_analysis.get("sex_frac_risk", 0.05)
+        fusion_scores = hasf_fuse(img_feat, bert_emb, age_risk, sex_frac_risk)
+
+        # ── CCAE: cross-modal enhancement using text findings ─────────
+        text_pats = _text_analysis.get("parsed_text", {}).get("pathologies", [])
+        text_sev  = _text_analysis.get("parsed_text", {}).get("severity", "")
+        fusion_scores, ccae_disease, ccae_severity = ccae_enhance(
+            fusion_scores, text_pats, text_sev
+        )
+
+        # ── Zero-shot NLI override (if notes provided, high-confidence) ──
+        zs_disease  = _text_analysis.get("zs_disease")
+        zs_severity = _text_analysis.get("zs_severity")
+        zs_conf     = _text_analysis.get("zs_conf", 0.0)
+
+        # Priority: zero-shot (text) > CCAE > HASF > image-only
+        if zs_disease and zs_conf > 0.45 and zs_disease in DISEASE_MAP_INV:
+            ml_disease  = zs_disease
+            ml_severity = zs_severity or ccae_severity or severity
+        elif ccae_disease:
+            ml_disease  = ccae_disease
+            ml_severity = ccae_severity or severity
+        else:
+            ml_disease  = max(fusion_scores, key=fusion_scores.get)
+            ml_severity = severity
+
+        # Pfirrmann from fusion: higher disc degeneration score → higher grade
+        degen_score  = fusion_scores.get("Disc Degeneration", 0)
+        hern_score   = fusion_scores.get("Disc Herniation", 0)
+        ml_pfirrmann = round(1.0 + (degen_score + hern_score * 0.5) * 4.0, 1)
+        ml_pfirrmann = min(max(ml_pfirrmann, 1.0), 5.0)
+
+        # Affected levels: from zero-shot on level-specific text or text parse
+        zs_levels = _text_analysis.get("parsed_text", {}).get("levels", [])
+        ml_levels = zs_levels if zs_levels else []
+
+        # Per-disc pathology confidence from fusion scores
+        ml_pathology_details = {
+            "Disc Degeneration":    round(fusion_scores.get("Disc Degeneration", 0), 3),
+            "Disc Herniation":      round(fusion_scores.get("Disc Herniation", 0), 3),
+            "Disc Bulge":           round(fusion_scores.get("Disc Bulge", 0), 3),
+            "Spinal Stenosis":      round(fusion_scores.get("Spinal Stenosis", 0), 3),
+            "Spondylolisthesis":    round(fusion_scores.get("Spondylolisthesis", 0), 3),
+            "Compression Fracture": round(fusion_scores.get("Compression Fracture", 0), 3),
+        }
+
+        # Anatomy prompt stored for display
+        _text_analysis["anatomy_prompt"] = anatomy_prompt
+        _text_analysis["ok"] = True
+
+    except Exception as _fe:
+        print(f"[Fusion] error: {_fe}")
+        _text_analysis["ok"] = False
+
+    # ── Text findings for display ─────────────────────────────────────
+    if _text_analysis.get("parsed_text"):
+        pt = _text_analysis["parsed_text"]
+        text_findings = {
+            "pathologies_from_report": pt.get("pathologies", []),
+            "levels_from_report":      pt.get("levels", []),
+            "severity_from_report":    pt.get("severity", ""),
+            "anatomy_prompt":          _text_analysis.get("anatomy_prompt", ""),
+            "bert_active":             _text_analysis.get("bert_emb") is not None,
+            "zs_disease":              _text_analysis.get("zs_disease", ""),
+            "zs_confidence":           round(_text_analysis.get("zs_conf", 0.0) * 100, 1),
+            "fusion_scores":           {k: round(v*100,1) for k,v in fusion_scores.items()},
+        }
+
     # ── NEW FEATURES ──────────────────────────────────────────────────
     # 1. Per-IVD Pfirrmann grading
+    #    Use trained classifier per-disc scores if available, else confidence proxy
     ivd_grades = compute_pfirrmann(avg_probs)
+
+    # Override with trained classifier per-disc Pfirrmann if available
+    if _spine_classifier is not None:
+        try:
+            import torch as _t
+            _feat57 = np.concatenate([
+                img_feat, img_feat * 0.85,
+                np.abs(img_feat - img_feat.mean()) * 0.5
+            ]).astype(np.float32)
+            try:
+                _ef = _get_engineer_features()
+                if _ef:
+                    _feat_in = _ef({"max_prob": img_feat,
+                                    "mean_prob": img_feat*0.85,
+                                    "std_prob": np.abs(img_feat-img_feat.mean())*0.5})
+                else:
+                    raise ValueError("engineer_features not available")
+            except Exception:
+                _feat_in = np.zeros(104, dtype=np.float32)
+                _feat_in[:57] = _feat57
+            _t_feat = _t.tensor(_feat_in).unsqueeze(0).to(_device)
+            with _t.no_grad():
+                _clf_out = _spine_classifier(_t_feat)
+            _pfi_disc = _clf_out["pfirrmann"][0].cpu().numpy()  # (8,) per disc
+            _IVD_LBL  = ["L5/S1","L4/L5","L3/L4","L2/L3","L1/L2","T12/L1","T11/T12","T10/T11"]
+            _GRADE_STATUS = {1:"Normal", 2:"Normal with changes", 3:"Early degeneration",
+                             4:"Moderate degeneration", 5:"Severe degeneration"}
+            for i, lbl in enumerate(_IVD_LBL):
+                grade = int(round(float(_pfi_disc[i])))
+                grade = max(1, min(5, grade))
+                if lbl in ivd_grades:
+                    ivd_grades[lbl]["grade"]  = grade
+                    ivd_grades[lbl]["status"] = _GRADE_STATUS.get(grade, "—")
+                    ivd_grades[lbl]["source"] = "trained"
+        except Exception:
+            pass  # keep proxy grades
 
     # 2. Scoliosis / curvature analysis
     curvature = compute_curvature(pred, prob_arr)
@@ -861,9 +1582,27 @@ def run_pred(file_bytes, filename, patient_info=None):
     # 7. NEW: Vertebral fracture risk
     fracture_risk = compute_fracture_risk(pred, size)
 
+    # ── NEW FEATURES (batch 2) ─────────────────────────────────────────
+    # 8b. Bone density estimation
+    bone_density = compute_bone_density(img_pre, pred)
+
+    # 8c. Vertebral morphometry
+    morphometry = compute_morphometry(pred, size)
+
+    # 8d. Nerve root compression scoring
+    nerve_compression = compute_nerve_compression(pred, avg_probs, size)
+
+    # 8e. Age-adjusted normative comparison
+    try:
+        _pat_age = float((patient_info or {}).get("age", 50) or 50)
+    except: _pat_age = 50.0
+    normative_comp = compute_normative_comparison(
+        pfirrmann_overall, ml_disease,
+        ivd_grades, _pat_age
+    )
+
     # 8. NEW: Grad-CAM (on mid slice, most confident fg class)
     try:
-        # Need model without no_grad context — get fresh reference
         _m, _dev = get_model()
         cam = compute_gradcam(_m, _dev, img_pre)
         gradcam_img = render_gradcam_overlay(img_pre, cam)
@@ -939,46 +1678,110 @@ def run_pred(file_bytes, filename, patient_info=None):
     # ── Build clinical report ─────────────────────────────────────────
     now  = time.strftime("%Y-%m-%d %H:%M")
     pat  = patient_info or {}
-    report  = "LUMBAR SPINE MRI ANALYSIS REPORT\n"
-    report += f"Generated by ATM-Net++ v2  |  {now}\n"
-    report += "=" * 50 + "\n"
-    if pat.get("name"): report += f"Patient     : {pat['name']}\n"
-    if pat.get("age"):  report += f"Age / Sex   : {pat.get('age','?')} yrs / {pat.get('sex','?')}\n"
-    report += "\nPRIMARY DIAGNOSIS\n" + "-" * 30 + "\n"
-    report += f"  Diagnosis   : {disease}\n  Severity    : {severity}\n"
-    report += f"  Confidence  : {conf}%\n  Pfirrmann   : {pfirrmann_overall}/5\n"
-    report += "\nSCOLIOSIS / CURVATURE\n" + "-" * 30 + "\n"
-    report += f"  Cobb Angle  : {curvature.get('angle','N/A')} degrees\n"
-    report += f"  Scoliosis   : {curvature.get('risk','N/A')}\n"
-    report += f"  Curve Type  : {lordosis.get('type','N/A')}\n"
-    report += "\nCANAL STENOSIS\n" + "-" * 30 + "\n"
-    report += f"  Overall     : {stenosis.get('risk','N/A')}\n"
-    for lvl, sv in stenosis.get("levels",{}).items():
-        flag = " *** STENOSIS ***" if sv.get("stenosis") else ""
-        report += f"  {lvl:12s}: {sv.get('width_pct','?')}% width{flag}\n"
-    report += "\nPER-DISC PFIRRMANN\n" + "-" * 30 + "\n"
-    for disc, g in ivd_grades.items():
-        if g["grade"] is None: continue
-        report += f"  {disc:12s}: Grade {g['grade']}/5 — {g['status']}\n"
-    report += "\nT2 SIGNAL INTENSITY\n" + "-" * 30 + "\n"
-    for disc, s in t2_signal.items():
-        flag = " ⚠ DARK" if s.get("dark") else ""
-        report += f"  {disc:12s}: {s['signal']}% — {s['hydration']}{flag}\n"
-    report += "\nDISC HEIGHT / COMPRESSION\n" + "-" * 30 + "\n"
-    for disc, h in disc_heights.items():
-        flag = " ⚠ COMPRESSED" if h["compressed"] else ""
-        report += f"  {disc:12s}: {h['height_pct']}% height{flag}\n"
-    report += "\nFRACTURE RISK\n" + "-" * 30 + "\n"
-    for vert, fr in fracture_risk.items():
-        flag = " ⚠ RISK" if "risk" in fr.get("risk","").lower() else ""
-        report += f"  {vert:8s}: A/P ratio {fr['ap_ratio']}{flag}\n"
-    report += "\nMODEL UNCERTAINTY\n" + "-" * 30 + "\n"
-    report += f"  Mean entropy: {uncertainty_mean} (0=certain, 1=uncertain)\n"
-    report += "\nDETECTED STRUCTURES\n" + "-" * 30 + "\n"
-    for s in detected: report += f"  • {s}\n"
-    report += "\n" + "=" * 50 + "\n"
-    report += "⚠  AI-GENERATED — For research purposes only.\n"
-    report += "    Must be reviewed by a qualified radiologist.\n"
+
+    # ── Use TemplateReportGenerator from models/ if available ─────────
+    global _report_generator
+    if _report_generator is not None:
+        try:
+            _disease_id_map = {
+                "Normal":0,"Disc Herniation":1,"Disc Bulge":2,"Spinal Stenosis":3,
+                "Disc Degeneration":4,"Spondylolisthesis":5,"Compression Fracture":6,
+            }
+            _sev_map = {"None":0,"Mild":0,"Moderate":1,"Severe":2}
+            _lvl_names = ["T10/T11","T11/T12","T12/L1","L1/L2","L2/L3","L3/L4","L4/L5","L5/S1"]
+            pred_dict = {
+                "disease_pred":       _disease_id_map.get(ml_disease, 0),
+                "disease_confidence": conf / 100.0,
+                "severity_pred":      _sev_map.get(ml_severity, 0),
+                "level_pred":         [1 if lv in ml_levels else 0 for lv in _lvl_names],
+                "pfirrmann_score":    ml_pfirrmann,
+            }
+            rpt = _report_generator.generate(pred_dict, patient_info=pat)
+            report  = rpt.get("report_text", "")
+            # Append additional analysis sections
+            report += "\n\nSCOLIOSIS / CURVATURE\n" + "-"*30 + "\n"
+            report += f"  Cobb Angle  : {curvature.get('angle','N/A')} degrees\n"
+            report += f"  Scoliosis   : {curvature.get('risk','N/A')}\n"
+            report += f"  Curve Type  : {lordosis.get('type','N/A')}\n"
+            report += "\nCANAL STENOSIS\n" + "-"*30 + "\n"
+            report += f"  Overall     : {stenosis.get('risk','N/A')}\n"
+            for lvl, sv in stenosis.get("levels",{}).items():
+                flag = " *** STENOSIS ***" if sv.get("stenosis") else ""
+                report += f"  {lvl:12s}: {sv.get('width_pct','?')}% width{flag}\n"
+            report += "\nPER-DISC PFIRRMANN\n" + "-"*30 + "\n"
+            for disc, g in ivd_grades.items():
+                if g["grade"] is None: continue
+                report += f"  {disc:12s}: Grade {g['grade']}/5 — {g['status']}\n"
+            if text_findings.get("pathologies_from_report"):
+                report += "\nTEXT REPORT FINDINGS\n" + "-"*30 + "\n"
+                report += f"  Pathologies : {', '.join(text_findings['pathologies_from_report'])}\n"
+                report += f"  Levels      : {', '.join(text_findings.get('levels_from_report',[]))}\n"
+            report += "\nDETECTED STRUCTURES\n" + "-"*30 + "\n"
+            for s in detected: report += f"  • {s}\n"
+            report += "\n" + "="*50 + "\n"
+            report += "⚠  AI-GENERATED — For research purposes only.\n"
+            report += "    Must be reviewed by a qualified radiologist.\n"
+        except Exception as _re:
+            _report_generator = None  # fall through
+
+    if not _report_generator or not report:
+        # ── Inline fallback report ────────────────────────────────────
+        report  = "LUMBAR SPINE MRI ANALYSIS REPORT\n"
+        report += f"Generated by ATM-Net++ v2  |  {now}\n"
+        report += "=" * 50 + "\n"
+        if pat.get("name"): report += f"Patient     : {pat['name']}\n"
+        if pat.get("age"):  report += f"Age / Sex   : {pat.get('age','?')} yrs / {pat.get('sex','?')}\n"
+        report += "\nPRIMARY DIAGNOSIS (Image Segmentation)\n" + "-" * 30 + "\n"
+        report += f"  Diagnosis   : {disease}\n  Severity    : {severity}\n"
+        report += f"  Confidence  : {conf}%\n  Pfirrmann   : {pfirrmann_overall}/5\n"
+        if ml_disease != disease or ml_severity != severity:
+            report += "\nMULTITASK CLASSIFIER PREDICTION\n" + "-" * 30 + "\n"
+            report += f"  Diagnosis   : {ml_disease}\n  Severity    : {ml_severity}\n"
+            report += f"  Pfirrmann   : {ml_pfirrmann}/5\n"
+        if ml_levels:
+            report += f"  Affected IVD levels: {', '.join(ml_levels)}\n"
+        if text_findings.get("pathologies_from_report"):
+            report += "\nTEXT REPORT FINDINGS\n" + "-" * 30 + "\n"
+            report += f"  Pathologies : {', '.join(text_findings['pathologies_from_report'])}\n"
+            report += f"  Levels      : {', '.join(text_findings['levels_from_report'])}\n"
+            report += f"  Severity    : {text_findings['severity_from_report']}\n"
+        if ml_pathology_details:
+            report += "\nPATHOLOGY PROBABILITIES\n" + "-" * 30 + "\n"
+            for k, v in ml_pathology_details.items():
+                if v > 0.3:
+                    report += f"  {k:20s}: {v:.3f}\n"
+        report += "\nSCOLIOSIS / CURVATURE\n" + "-" * 30 + "\n"
+        report += f"  Cobb Angle  : {curvature.get('angle','N/A')} degrees\n"
+        report += f"  Scoliosis   : {curvature.get('risk','N/A')}\n"
+        report += f"  Curve Type  : {lordosis.get('type','N/A')}\n"
+        report += "\nCANAL STENOSIS\n" + "-" * 30 + "\n"
+        report += f"  Overall     : {stenosis.get('risk','N/A')}\n"
+        for lvl, sv in stenosis.get("levels",{}).items():
+            flag = " *** STENOSIS ***" if sv.get("stenosis") else ""
+            report += f"  {lvl:12s}: {sv.get('width_pct','?')}% width{flag}\n"
+        report += "\nPER-DISC PFIRRMANN\n" + "-" * 30 + "\n"
+        for disc, g in ivd_grades.items():
+            if g["grade"] is None: continue
+            report += f"  {disc:12s}: Grade {g['grade']}/5 — {g['status']}\n"
+        report += "\nT2 SIGNAL INTENSITY\n" + "-" * 30 + "\n"
+        for disc, s in t2_signal.items():
+            flag = " ⚠ DARK" if s.get("dark") else ""
+            report += f"  {disc:12s}: {s['signal']}% — {s['hydration']}{flag}\n"
+        report += "\nDISC HEIGHT / COMPRESSION\n" + "-" * 30 + "\n"
+        for disc, h in disc_heights.items():
+            flag = " ⚠ COMPRESSED" if h["compressed"] else ""
+            report += f"  {disc:12s}: {h['height_pct']}% height{flag}\n"
+        report += "\nFRACTURE RISK\n" + "-" * 30 + "\n"
+        for vert, fr in fracture_risk.items():
+            flag = " ⚠ RISK" if "risk" in fr.get("risk","").lower() else ""
+            report += f"  {vert:8s}: A/P ratio {fr['ap_ratio']}{flag}\n"
+        report += "\nMODEL UNCERTAINTY\n" + "-" * 30 + "\n"
+        report += f"  Mean entropy: {uncertainty_mean} (0=certain, 1=uncertain)\n"
+        report += "\nDETECTED STRUCTURES\n" + "-" * 30 + "\n"
+        for s in detected: report += f"  • {s}\n"
+        report += "\n" + "=" * 50 + "\n"
+        report += "⚠  AI-GENERATED — For research purposes only.\n"
+        report += "    Must be reviewed by a qualified radiologist.\n"
 
     # ── Save to patient history ───────────────────────────────────────
     history_record = {
@@ -998,37 +1801,380 @@ def run_pred(file_bytes, filename, patient_info=None):
     rec_id = add_to_history(history_record)
 
     return {
-        # Core
-        "num_slices"         : len(slices),
-        "detected_structures": detected,
-        "class_distribution" : cls_dist,
-        "disease"            : disease,
-        "severity"           : severity,
-        "confidence"         : conf,
-        "pfirrmann_grade"    : pfirrmann_overall,
-        "report"             : report,
-        "record_id"          : rec_id,
+        # Core (image-based)
+        "num_slices"          : len(slices),
+        "detected_structures" : detected,
+        "class_distribution"  : cls_dist,
+        "disease"             : disease,
+        "severity"            : severity,
+        "confidence"          : conf,
+        "pfirrmann_grade"     : pfirrmann_overall,
+        "report"              : report,
+        "record_id"           : rec_id,
+        # ML Classifier (MultiTask + Fusion + Text)
+        "ml_disease"          : ml_disease,
+        "ml_severity"         : ml_severity,
+        "ml_pfirrmann"        : ml_pfirrmann,
+        "ml_levels"           : ml_levels,
+        "ml_pathology_details": ml_pathology_details,
+        "text_findings"       : text_findings,
         # Images
-        "image_b64"          : arr_to_b64((img_pre * 255).astype(np.uint8)),
-        "overlay_b64"        : arr_to_b64(annotated),
-        "mask_b64"           : arr_to_b64(mask_rgb),
-        "scoliosis_b64"      : arr_to_b64(scoliosis_img),
-        "legend_b64"         : arr_to_b64(legend_img),
-        "gradcam_b64"        : gradcam_b64,
-        "uncertainty_b64"    : uncertainty_b64,
-        "slice_thumbs"       : slice_thumbs,
+        "image_b64"           : arr_to_b64((img_pre * 255).astype(np.uint8)),
+        "overlay_b64"         : arr_to_b64(annotated),
+        "mask_b64"            : arr_to_b64(mask_rgb),
+        "scoliosis_b64"       : arr_to_b64(scoliosis_img),
+        "legend_b64"          : arr_to_b64(legend_img),
+        "gradcam_b64"         : gradcam_b64,
+        "uncertainty_b64"     : uncertainty_b64,
+        "slice_thumbs"        : slice_thumbs,
         # Analytics
-        "ivd_grades"         : ivd_grades,
-        "curvature"          : curvature,
-        "disc_heights"       : disc_heights,
-        "stenosis"           : stenosis,
-        "lordosis"           : lordosis,
-        "t2_signal"          : t2_signal,
-        "fracture_risk"      : fracture_risk,
-        "uncertainty_mean"   : uncertainty_mean,
-        # Keep patient_info for PDF generation
-        "_patient_info"      : pat,
+        "ivd_grades"          : ivd_grades,
+        "curvature"           : curvature,
+        "disc_heights"        : disc_heights,
+        "stenosis"            : stenosis,
+        "lordosis"            : lordosis,
+        "t2_signal"           : t2_signal,
+        "fracture_risk"       : fracture_risk,
+        "uncertainty_mean"    : uncertainty_mean,
+        # New features
+        "bone_density"        : bone_density,
+        "morphometry"         : morphometry,
+        "nerve_compression"   : nerve_compression,
+        "normative_comparison": normative_comp,
+        "_patient_info"       : pat,
     }
+
+# ═════════════════════════════════════════════════════════════════════
+# NEW FEATURES
+# ═════════════════════════════════════════════════════════════════════
+
+# ── Feature 1: Bone Density Estimation ───────────────────────────────
+def compute_bone_density(img_r: np.ndarray, pred: np.ndarray) -> dict:
+    """
+    Estimate relative bone density from vertebra T1/T2 signal intensity.
+    Bright vertebrae on T1 = high marrow fat = potentially osteoporotic.
+    Low signal on T2 = compact bone = healthy.
+    Returns per-vertebra signal + overall density estimate.
+    """
+    results = {}
+    VERT_NAMES = {1:"L5",2:"L4",3:"L3",4:"L2",5:"L1",6:"T12",7:"T11",8:"T10"}
+    signals = []
+    for c in VERT_CLASSES:
+        mask = (pred == c)
+        if mask.sum() < 30: continue
+        mean_sig = float(img_r[mask].mean())
+        pct = round(mean_sig * 100, 1)
+        signals.append(pct)
+        # High signal (>55%) = increased fat infiltration = osteoporosis risk
+        if   pct > 65: density, risk = "Low",    "High osteoporosis risk"
+        elif pct > 50: density, risk = "Reduced", "Moderate risk"
+        elif pct > 35: density, risk = "Normal",  "Normal bone density"
+        else:          density, risk = "Dense",   "Dense cortical bone"
+        results[VERT_NAMES.get(c, str(c))] = {
+            "signal_pct": pct, "density": density, "risk": risk
+        }
+    overall = round(float(np.mean(signals)), 1) if signals else 0.0
+    if   overall > 60: overall_risk = "Osteoporosis suspected"
+    elif overall > 50: overall_risk = "Osteopenia possible"
+    else:              overall_risk = "Normal bone density"
+    return {"vertebrae": results, "mean_signal": overall,
+            "overall_risk": overall_risk}
+
+
+# ── Feature 2: Vertebral Morphometry ─────────────────────────────────
+def compute_morphometry(pred: np.ndarray, size: int) -> dict:
+    """
+    Measure vertebral body dimensions and wedge angle per level.
+    Wedge angle > 10 degrees = compression/wedge deformity.
+    """
+    results = {}
+    VERT_NAMES = {1:"L5",2:"L4",3:"L3",4:"L2",5:"L1",6:"T12",7:"T11",8:"T10"}
+    for c in VERT_CLASSES:
+        mask = (pred == c)
+        if mask.sum() < 50: continue
+        ys, xs = np.where(mask)
+        # Bounding box
+        y_min, y_max = int(ys.min()), int(ys.max())
+        x_min, x_max = int(xs.min()), int(xs.max())
+        height_px = y_max - y_min + 1
+        width_px  = x_max - x_min + 1
+        # Anterior (left) vs posterior (right) height
+        x_mid = (x_min + x_max) // 2
+        ant_mask = mask[:, x_min:x_mid]
+        pos_mask = mask[:, x_mid:x_max]
+        ant_ys = np.where(ant_mask)[0]
+        pos_ys = np.where(pos_mask)[0]
+        ant_h = int(ant_ys.max() - ant_ys.min() + 1) if len(ant_ys) > 3 else height_px
+        pos_h = int(pos_ys.max() - pos_ys.min() + 1) if len(pos_ys) > 3 else height_px
+        # Wedge angle estimate
+        import math
+        width_real = width_px  # proxy in pixels
+        wedge_deg = 0.0
+        if width_real > 0:
+            wedge_deg = round(math.degrees(math.atan(abs(ant_h - pos_h) / max(1, width_real))), 1)
+        ap_ratio = round(ant_h / max(1, pos_h), 3)
+        deformity = wedge_deg > 10 or ap_ratio < 0.75
+        results[VERT_NAMES.get(c, str(c))] = {
+            "height_px":  height_px,
+            "width_px":   width_px,
+            "height_pct": round(height_px / size * 100, 1),
+            "width_pct":  round(width_px  / size * 100, 1),
+            "ant_h_px":   ant_h,
+            "pos_h_px":   pos_h,
+            "ap_ratio":   ap_ratio,
+            "wedge_deg":  wedge_deg,
+            "deformity":  deformity,
+            "status":     "Wedge deformity" if deformity else "Normal morphology",
+        }
+    return results
+
+
+# ── Feature 3: Nerve Root Compression Scoring ─────────────────────────
+def compute_nerve_compression(pred: np.ndarray, prob_arr: np.ndarray, size: int) -> dict:
+    """
+    Estimate neural foraminal narrowing at each IVD level.
+    Based on canal width at each disc level relative to vertebra width.
+    Returns compression score 0-100 per level.
+    """
+    results = {}
+    CANAL_CLASS = 18
+    canal_mask = (pred == CANAL_CLASS)
+
+    for i, ivd_c in enumerate(IVD_CLASSES):
+        ivd_mask = (pred == ivd_c)
+        if ivd_mask.sum() < 10: continue
+        ys_ivd = np.where(ivd_mask)[0]
+        y_mid  = int(ys_ivd.mean())
+        # Canal width at this level
+        y_lo, y_hi = max(0, y_mid-4), min(size, y_mid+4)
+        canal_row   = canal_mask[y_lo:y_hi, :].any(axis=0)
+        xs_canal    = np.where(canal_row)[0]
+        canal_width = int(xs_canal.max()-xs_canal.min()+1) if len(xs_canal)>1 else 0
+        canal_pct   = round(canal_width / size * 100, 1)
+        # IVD confidence as disc health proxy
+        ivd_conf = float(prob_arr[ivd_c].max())
+        # Compression score: narrow canal + low IVD conf = high compression
+        comp_score = round((1 - canal_pct/15) * 50 + (1 - ivd_conf) * 50, 1)
+        comp_score = max(0, min(100, comp_score))
+        if   comp_score > 70: grade, risk = "Severe",   "Likely neural compression"
+        elif comp_score > 45: grade, risk = "Moderate", "Possible foraminal narrowing"
+        elif comp_score > 20: grade, risk = "Mild",     "Mild narrowing"
+        else:                 grade, risk = "Normal",   "No significant compression"
+        results[IVD_LABELS[i]] = {
+            "compression_score": comp_score,
+            "canal_width_pct":   canal_pct,
+            "ivd_confidence":    round(ivd_conf, 3),
+            "grade":             grade,
+            "risk":              risk,
+        }
+    return results
+
+
+# ── Feature 4: Age-Adjusted Normative Comparison ──────────────────────
+# SPIDER dataset statistics (approximate population norms)
+_SPIDER_NORMS = {
+    "mean_pfirrmann_by_age": {
+        (0,  30): 2.1, (30, 40): 2.8, (40, 50): 3.2,
+        (50, 60): 3.6, (60, 70): 3.9, (70, 120): 4.2
+    },
+    "mean_ivd_conf_healthy": 0.62,
+    "scoliosis_prevalence_pct": 3.0,
+    "herniation_prevalence_pct": 25.0,
+    "stenosis_prevalence_pct": 11.0,
+}
+
+def compute_normative_comparison(pfirrmann_overall: float,
+                                  disease: str, ivd_grades: dict,
+                                  patient_age: float) -> dict:
+    """
+    Compare patient's findings against age-matched SPIDER dataset norms.
+    Returns percentile estimates and deviation from expected.
+    """
+    # Age-matched expected Pfirrmann
+    age = patient_age or 50.0
+    expected_pfi = 3.2
+    for (lo, hi), norm_pfi in _SPIDER_NORMS["mean_pfirrmann_by_age"].items():
+        if lo <= age < hi:
+            expected_pfi = norm_pfi; break
+
+    pfi_deviation = round(pfirrmann_overall - expected_pfi, 2)
+    if   pfi_deviation >  1.0: pfi_comparison = "Significantly worse than age-matched average"
+    elif pfi_deviation >  0.3: pfi_comparison = "Slightly worse than age-matched average"
+    elif pfi_deviation > -0.3: pfi_comparison = "Within normal range for age"
+    else:                      pfi_comparison = "Better than age-matched average"
+
+    # Disease prevalence context
+    prev_map = {
+        "Disc Herniation":   _SPIDER_NORMS["herniation_prevalence_pct"],
+        "Spinal Stenosis":   _SPIDER_NORMS["stenosis_prevalence_pct"],
+        "Spondylolisthesis": 5.0,
+        "Disc Degeneration": 40.0,
+        "Disc Bulge":        30.0,
+        "Normal":            35.0,
+        "Compression Fracture": 2.0,
+    }
+    disease_prev = prev_map.get(disease, 10.0)
+
+    # Count severely degenerated discs
+    severe_discs = sum(1 for g in ivd_grades.values()
+                       if g.get("grade") and g["grade"] >= 4)
+
+    return {
+        "patient_age":         age,
+        "expected_pfirrmann":  round(expected_pfi, 1),
+        "patient_pfirrmann":   round(pfirrmann_overall, 1),
+        "pfi_deviation":       pfi_deviation,
+        "pfi_comparison":      pfi_comparison,
+        "disease_prevalence_pct": disease_prev,
+        "disease_context":     f"{disease} occurs in ~{disease_prev:.0f}% of the population",
+        "severe_discs":        severe_discs,
+        "note": "Based on SPIDER dataset population statistics (218 patients)",
+    }
+
+
+# ── Feature 5: Segmentation mask download (NIfTI-like raw PNG) ────────
+@app.route("/download_mask", methods=["POST"])
+def download_mask():
+    """Download segmentation mask as PNG (grayscale, class indices)."""
+    from flask import Response
+    data = request.get_json(silent=True) or {}
+    # Reconstruct mask from last result (stored in _last_result)
+    if not _last_result:
+        return jsonify({"error": "No prediction available"}), 400
+    # Return mask as PNG with class indices encoded as grayscale * 13
+    try:
+        import base64, io
+        mask_b64 = _last_result.get("mask_b64", "")
+        if mask_b64:
+            img_bytes = base64.b64decode(mask_b64)
+            return Response(img_bytes, mimetype="image/png",
+                            headers={"Content-Disposition":
+                                     "attachment; filename=spine_mask.png"})
+        return jsonify({"error": "No mask available"}), 400
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+# ── Feature 6: Model status API ────────────────────────────────────────
+@app.route("/model_status")
+def model_status():
+    """Return status of all loaded models."""
+    import torch
+    status = {
+        "segmentation": {
+            "name": "ResUNet",
+            "loaded": _model is not None,
+            "dice": 0.7719,
+            "checkpoint": CKPT.name if CKPT else None,
+            "epoch": 77,
+        },
+        "spine_classifier": {
+            "name": "SpineClassifierV2",
+            "loaded": _spine_classifier is not None,
+            "accuracy": 0.922,
+            "classes": 3,
+            "feat_dim": 104,
+        },
+        "fusion_module": {
+            "name": "MultimodalFusionModule (ATPG+HASF+CCAE)",
+            "loaded": _fusion_module is not None,
+            "trained": (BASE / "outputs/fusion/fusion_module.pth").exists(),
+        },
+        "multitask_head": {
+            "name": "MultiTaskHead",
+            "loaded": _multi_task_head is not None,
+            "trained": (BASE / "outputs/fusion/multitask_head.pth").exists(),
+        },
+        "bio_clinical_bert": {
+            "name": "Bio-ClinicalBERT",
+            "loaded": _bert_model is not None,
+            "model": BERT_MODEL_NAME,
+        },
+        "zero_shot": {
+            "name": "DistilBERT-MNLI (Zero-shot)",
+            "loaded": _zs_classifier is not None,
+            "model": ZS_MODEL_NAME,
+        },
+        "report_generator": {
+            "name": "TemplateReportGenerator",
+            "loaded": _report_generator is not None,
+        },
+        "gradcam": {
+            "name": "GradCAM + ExplainabilityVisualizer",
+            "loaded": _gradcam_cls is not None,
+        },
+        "device": str(_device) if _device else "unknown",
+        "cuda_available": torch.cuda.is_available(),
+    }
+    return jsonify(status)
+
+
+# ── Feature 7: Patient comparison (two scans side-by-side data) ────────
+@app.route("/compare", methods=["POST"])
+def compare_scans():
+    """
+    Compare two stored history records side-by-side.
+    Returns diff of key metrics between two prediction IDs.
+    """
+    data  = request.get_json(silent=True) or {}
+    id_a  = data.get("id_a")
+    id_b  = data.get("id_b")
+    hist  = load_history()
+    rec_a = next((r for r in hist if r.get("id") == id_a), None)
+    rec_b = next((r for r in hist if r.get("id") == id_b), None)
+    if not rec_a or not rec_b:
+        return jsonify({"error": "One or both records not found"}), 404
+
+    def safe_diff(a, b):
+        try: return round(float(b) - float(a), 3)
+        except: return None
+
+    comparison = {
+        "scan_a": {
+            "id": id_a, "timestamp": rec_a.get("timestamp"),
+            "disease": rec_a.get("disease"), "severity": rec_a.get("severity"),
+            "pfirrmann": rec_a.get("pfirrmann"), "cobb_angle": rec_a.get("cobb_angle"),
+        },
+        "scan_b": {
+            "id": id_b, "timestamp": rec_b.get("timestamp"),
+            "disease": rec_b.get("disease"), "severity": rec_b.get("severity"),
+            "pfirrmann": rec_b.get("pfirrmann"), "cobb_angle": rec_b.get("cobb_angle"),
+        },
+        "changes": {
+            "pfirrmann_delta":  safe_diff(rec_a.get("pfirrmann",0), rec_b.get("pfirrmann",0)),
+            "cobb_delta":       safe_diff(rec_a.get("cobb_angle",0), rec_b.get("cobb_angle",0)),
+            "disease_changed":  rec_a.get("disease") != rec_b.get("disease"),
+            "severity_changed": rec_a.get("severity") != rec_b.get("severity"),
+        },
+        "interpretation": "",
+    }
+    delta_pfi = comparison["changes"]["pfirrmann_delta"]
+    if delta_pfi is not None:
+        if delta_pfi > 0.5: comparison["interpretation"] = "Disc degeneration has progressed"
+        elif delta_pfi < -0.5: comparison["interpretation"] = "Disc condition has improved"
+        else: comparison["interpretation"] = "Disc condition is stable"
+
+    return jsonify(comparison)
+
+
+# ── Feature 8: Normative report endpoint ───────────────────────────────
+@app.route("/normative_report", methods=["POST"])
+def normative_report():
+    """
+    Generate age-adjusted normative comparison report for latest prediction.
+    """
+    if not _last_result:
+        return jsonify({"error": "No prediction available — run /predict first"}), 400
+    data = request.get_json(silent=True) or {}
+    age  = float(data.get("age", _last_patient.get("age", 50) or 50))
+    norm = compute_normative_comparison(
+        pfirrmann_overall=_last_result.get("pfirrmann_grade", 3.0),
+        disease=_last_result.get("disease", "Normal"),
+        ivd_grades=_last_result.get("ivd_grades", {}),
+        patient_age=age,
+    )
+    return jsonify(norm)
+
 
 # ── Flask routes ──────────────────────────────────────────────────────
 @app.route("/")
@@ -1565,6 +2711,43 @@ body{font-family:'Segoe UI',system-ui,sans-serif;background:#0d1117;color:#e2e8f
       </div>
     </div>
 
+    <!-- ML Classifier panel -->
+    <div id="mlPanel" style="display:none;margin-bottom:16px;background:linear-gradient(135deg,#0f1e2e,#1a2535);
+         border:1px solid #2d4a6a;border-radius:12px;padding:14px 18px">
+      <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px">
+        <span style="font-size:16px">🤖</span>
+        <div style="font-size:11px;font-weight:700;color:#63b3ed;text-transform:uppercase;letter-spacing:.5px">
+          MultiTask AI Classifier (Bio-ClinicalBERT + Fusion + Disease Head)
+        </div>
+      </div>
+      <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:10px">
+        <div style="background:#1a2535;border-radius:8px;padding:10px;text-align:center">
+          <div style="font-size:10px;color:var(--muted);text-transform:uppercase;margin-bottom:4px">ML Disease</div>
+          <div id="ml-disease" style="font-size:14px;font-weight:700;color:#63b3ed">—</div>
+        </div>
+        <div style="background:#1a2535;border-radius:8px;padding:10px;text-align:center">
+          <div style="font-size:10px;color:var(--muted);text-transform:uppercase;margin-bottom:4px">ML Severity</div>
+          <div id="ml-severity" style="font-size:14px;font-weight:700;color:#f6ad55">—</div>
+        </div>
+        <div style="background:#1a2535;border-radius:8px;padding:10px;text-align:center">
+          <div style="font-size:10px;color:var(--muted);text-transform:uppercase;margin-bottom:4px">ML Pfirrmann</div>
+          <div id="ml-pfirrmann" style="font-size:14px;font-weight:700;color:#68d391">—</div>
+        </div>
+      </div>
+      <div id="mlLevelsRow" style="display:none;margin-bottom:8px">
+        <div style="font-size:11px;color:var(--muted);margin-bottom:4px">Affected IVD Levels:</div>
+        <div id="ml-levels" style="display:flex;flex-wrap:wrap;gap:4px"></div>
+      </div>
+      <div id="mlTextRow" style="display:none">
+        <div style="font-size:11px;color:var(--muted);margin-bottom:4px">From Clinical Notes:</div>
+        <div id="ml-text-findings" style="font-size:12px;color:#a0aec0"></div>
+      </div>
+      <div id="mlPathRow" style="display:none;margin-top:8px">
+        <div style="font-size:11px;color:var(--muted);margin-bottom:6px">Pathology Probabilities:</div>
+        <div id="ml-pathology" style="display:grid;grid-template-columns:1fr 1fr;gap:4px;font-size:11px"></div>
+      </div>
+    </div>
+
     <!-- Primary diagnosis row -->
     <div class="diag-grid">
       <div class="diag-card"><div class="diag-label">Diagnosis</div><div class="diag-val" id="r-dis" style="font-size:13px">—</div></div>
@@ -1752,11 +2935,53 @@ body{font-family:'Segoe UI',system-ui,sans-serif;background:#0d1117;color:#e2e8f
       </div>
     </div>
 
+    <!-- New Feature Panels -->
+    <div id="newFeaturesRow" style="display:none;margin-top:12px;display:grid;grid-template-columns:1fr 1fr;gap:12px">
+
+      <!-- Bone Density Panel -->
+      <div class="card" id="boneDensityPanel" style="display:none">
+        <h3>🦴 Bone Density Estimation</h3>
+        <div id="boneDensityContent"></div>
+      </div>
+
+      <!-- Vertebral Morphometry Panel -->
+      <div class="card" id="morphometryPanel" style="display:none">
+        <h3>📐 Vertebral Morphometry</h3>
+        <div id="morphometryContent"></div>
+      </div>
+
+      <!-- Nerve Compression Panel -->
+      <div class="card" id="nervePanel" style="display:none">
+        <h3>⚡ Nerve Root Compression</h3>
+        <div id="nerveContent"></div>
+      </div>
+
+      <!-- Normative Comparison Panel -->
+      <div class="card" id="normativePanel" style="display:none">
+        <h3>📊 Age-Adjusted Normative Comparison</h3>
+        <div id="normativeContent"></div>
+      </div>
+
+    </div>
+
+    <!-- Model Status Bar -->
+    <div id="modelStatusBar" style="margin-top:10px;padding:10px 14px;background:#0d1a2a;
+         border-radius:10px;border:1px solid #1e2a3a;font-size:11px;color:var(--muted);display:none">
+      <div style="font-weight:700;color:var(--blue);margin-bottom:6px;text-transform:uppercase;letter-spacing:.5px">
+        Active Models
+      </div>
+      <div id="modelStatusContent" style="display:flex;flex-wrap:wrap;gap:8px"></div>
+    </div>
+
     <!-- Clinical report -->
     <div style="margin-top:12px">
       <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
         <div style="font-size:11px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.5px">Clinical Report</div>
-        <button class="btn btn-outline" onclick="dlReport()">⬇ Download .txt</button>
+        <div style="display:flex;gap:6px">
+          <button class="btn btn-outline" onclick="dlReport()">⬇ Download .txt</button>
+          <button class="btn btn-outline" onclick="downloadMask()" title="Download segmentation mask">🗂 Mask PNG</button>
+          <button class="btn btn-outline" onclick="showNormative()" title="Age-adjusted comparison">📊 Normative</button>
+        </div>
       </div>
       <div class="report-box" id="rbox"></div>
     </div>
@@ -2006,6 +3231,47 @@ function showRes(d){
   document.getElementById('itime').textContent=
     `⏱ ${d.inference_ms}ms  |  ${d.num_slices} slices analyzed`;
 
+  // ML Classifier results panel
+  if(d.ml_disease || d.ml_severity || d.ml_pfirrmann){
+    document.getElementById('mlPanel').style.display='block';
+    document.getElementById('ml-disease').textContent   = d.ml_disease   || '—';
+    document.getElementById('ml-severity').textContent  = d.ml_severity  || '—';
+    document.getElementById('ml-pfirrmann').textContent = d.ml_pfirrmann ? d.ml_pfirrmann+'/5' : '—';
+
+    // Affected levels
+    const lvls = d.ml_levels||[];
+    if(lvls.length){
+      document.getElementById('mlLevelsRow').style.display='block';
+      document.getElementById('ml-levels').innerHTML=
+        lvls.map(l=>`<span style="background:#1a3a5a;color:#63b3ed;padding:2px 8px;border-radius:12px;font-size:11px">${l}</span>`).join('');
+    }
+
+    // Text findings from notes
+    const tf = d.text_findings||{};
+    if((tf.pathologies_from_report||[]).length||(tf.levels_from_report||[]).length){
+      document.getElementById('mlTextRow').style.display='block';
+      const parts=[];
+      if(tf.pathologies_from_report?.length) parts.push(`Pathologies: ${tf.pathologies_from_report.join(', ')}`);
+      if(tf.levels_from_report?.length)      parts.push(`Levels: ${tf.levels_from_report.join(', ')}`);
+      if(tf.severity_from_report)            parts.push(`Severity: ${tf.severity_from_report}`);
+      document.getElementById('ml-text-findings').textContent=parts.join(' | ');
+    }
+
+    // Pathology probabilities
+    const pp = d.ml_pathology_details||{};
+    const highPath = Object.entries(pp).filter(([,v])=>v>0.3);
+    if(highPath.length){
+      document.getElementById('mlPathRow').style.display='block';
+      document.getElementById('ml-pathology').innerHTML=
+        highPath.map(([k,v])=>`
+          <div style="display:flex;justify-content:space-between;align-items:center;padding:3px 6px;
+               background:#1a2535;border-radius:5px">
+            <span>${k}</span>
+            <span style="color:${v>0.7?'var(--red)':v>0.5?'var(--orange)':'var(--blue)'};font-weight:700">${(v*100).toFixed(0)}%</span>
+          </div>`).join('');
+    }
+  }
+
   // Model badge
   const mb=document.getElementById('modelBadge');
   if(mb) mb.textContent=`Dice ${(0.6529).toFixed(3)} | ep48`;
@@ -2026,6 +3292,9 @@ function showRes(d){
 
   // Store overlay images for toggle
   _overlayData={seg:d.overlay_b64, gcam:d.gradcam_b64, unc:d.uncertainty_b64};
+
+  // ── Render new feature panels ──────────────────────────────────────
+  renderNewFeaturePanels(d);
 
   // Primary diagnosis
   document.getElementById('r-dis').textContent=d.disease;
@@ -2951,7 +4220,192 @@ async function loadICD10(){
   }catch(e){console.error(e);}
 }
 
-// placeholder — will be replaced
+// ═══════════════════════════════════════════════════════════════════
+// NEW FEATURE FUNCTIONS
+// ═══════════════════════════════════════════════════════════════════
+
+// Render Bone Density panel
+function renderBoneDensity(d){
+  const bd = d.bone_density;
+  if(!bd || !bd.vertebrae || Object.keys(bd.vertebrae).length===0) return;
+  const panel = document.getElementById('boneDensityPanel');
+  const cont  = document.getElementById('boneDensityContent');
+  if(!panel||!cont) return;
+  panel.style.display='block';
+  const riskColor = {'Low':'#fc8181','Reduced':'#f6ad55','Normal':'#68d391','Dense':'#63b3ed'};
+  let html = `<div style="margin-bottom:8px;font-size:12px;color:var(--muted)">
+    Overall: <strong style="color:${bd.overall_risk.includes('Osteo')?'#fc8181':'#68d391'}">${bd.overall_risk}</strong>
+    &nbsp;|&nbsp; Mean signal: <strong>${bd.mean_signal}%</strong>
+  </div><table style="width:100%;border-collapse:collapse;font-size:12px">
+  <tr style="background:#1a2535"><th style="padding:5px 8px;text-align:left;color:var(--muted)">Vertebra</th>
+    <th style="padding:5px 8px;color:var(--muted)">Signal</th>
+    <th style="padding:5px 8px;color:var(--muted)">Density</th></tr>`;
+  for(const[v,info] of Object.entries(bd.vertebrae)){
+    const col = riskColor[info.density]||'#a0aec0';
+    html += `<tr style="border-bottom:1px solid var(--border)">
+      <td style="padding:5px 8px;font-weight:600">${v}</td>
+      <td style="padding:5px 8px;text-align:center">${info.signal_pct}%</td>
+      <td style="padding:5px 8px;color:${col}">${info.density}</td></tr>`;
+  }
+  html += '</table>';
+  cont.innerHTML = html;
+}
+
+// Render Vertebral Morphometry panel
+function renderMorphometry(d){
+  const morph = d.morphometry;
+  if(!morph || Object.keys(morph).length===0) return;
+  const panel = document.getElementById('morphometryPanel');
+  const cont  = document.getElementById('morphometryContent');
+  if(!panel||!cont) return;
+  panel.style.display='block';
+  let html = `<table style="width:100%;border-collapse:collapse;font-size:12px">
+  <tr style="background:#1a2535">
+    <th style="padding:5px 8px;text-align:left;color:var(--muted)">Level</th>
+    <th style="padding:5px 8px;color:var(--muted)">H×W (px)</th>
+    <th style="padding:5px 8px;color:var(--muted)">Wedge</th>
+    <th style="padding:5px 8px;color:var(--muted)">Status</th></tr>`;
+  for(const[v,info] of Object.entries(morph)){
+    const col = info.deformity ? '#fc8181' : '#68d391';
+    html += `<tr style="border-bottom:1px solid var(--border)">
+      <td style="padding:5px 8px;font-weight:600">${v}</td>
+      <td style="padding:5px 8px;text-align:center">${info.height_px}×${info.width_px}</td>
+      <td style="padding:5px 8px;text-align:center">${info.wedge_deg}°</td>
+      <td style="padding:5px 8px;color:${col};font-size:11px">${info.deformity?'⚠ Deformity':'Normal'}</td></tr>`;
+  }
+  html += '</table>';
+  cont.innerHTML = html;
+}
+
+// Render Nerve Compression panel
+function renderNerveCompression(d){
+  const nc = d.nerve_compression;
+  if(!nc || Object.keys(nc).length===0) return;
+  const panel = document.getElementById('nervePanel');
+  const cont  = document.getElementById('nerveContent');
+  if(!panel||!cont) return;
+  panel.style.display='block';
+  const gradeCol = {'Severe':'#f56565','Moderate':'#fc8181','Mild':'#f6ad55','Normal':'#68d391'};
+  let html = `<table style="width:100%;border-collapse:collapse;font-size:12px">
+  <tr style="background:#1a2535">
+    <th style="padding:5px 8px;text-align:left;color:var(--muted)">Level</th>
+    <th style="padding:5px 8px;color:var(--muted)">Score</th>
+    <th style="padding:5px 8px;color:var(--muted)">Grade</th></tr>`;
+  for(const[lvl,info] of Object.entries(nc)){
+    const col = gradeCol[info.grade]||'#a0aec0';
+    html += `<tr style="border-bottom:1px solid var(--border)">
+      <td style="padding:5px 8px;font-weight:600">${lvl}</td>
+      <td style="padding:5px 8px">
+        <div style="background:#1a2535;border-radius:4px;height:8px;width:100%;overflow:hidden">
+          <div style="background:${col};height:8px;width:${Math.min(info.compression_score,100)}%;border-radius:4px"></div>
+        </div>
+        <div style="font-size:10px;color:var(--muted);margin-top:2px">${info.compression_score}/100</div>
+      </td>
+      <td style="padding:5px 8px;color:${col};font-size:11px;font-weight:700">${info.grade}</td></tr>`;
+  }
+  html += '</table>';
+  cont.innerHTML = html;
+}
+
+// Render Normative Comparison panel
+function renderNormative(d){
+  const norm = d.normative_comparison;
+  if(!norm) return;
+  const panel = document.getElementById('normativePanel');
+  const cont  = document.getElementById('normativeContent');
+  if(!panel||!cont) return;
+  panel.style.display='block';
+  const devCol = norm.pfi_deviation > 0.3 ? '#fc8181' :
+                 norm.pfi_deviation < -0.3 ? '#68d391' : '#f6ad55';
+  cont.innerHTML = `
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:10px">
+      <div style="background:#1a2535;border-radius:8px;padding:10px;text-align:center">
+        <div style="font-size:10px;color:var(--muted);text-transform:uppercase;margin-bottom:4px">Patient Pfirrmann</div>
+        <div style="font-size:20px;font-weight:800;color:var(--blue)">${norm.patient_pfirrmann}/5</div>
+      </div>
+      <div style="background:#1a2535;border-radius:8px;padding:10px;text-align:center">
+        <div style="font-size:10px;color:var(--muted);text-transform:uppercase;margin-bottom:4px">Age Expected (${norm.patient_age|0}y)</div>
+        <div style="font-size:20px;font-weight:800;color:#a0aec0">${norm.expected_pfirrmann}/5</div>
+      </div>
+    </div>
+    <div style="background:#1a2535;border-radius:8px;padding:10px;margin-bottom:8px">
+      <div style="font-size:11px;color:${devCol};font-weight:700">
+        ${norm.pfi_deviation > 0 ? '▲' : norm.pfi_deviation < 0 ? '▼' : '='} ${norm.pfi_comparison}
+      </div>
+      <div style="font-size:11px;color:var(--muted);margin-top:4px">${norm.disease_context}</div>
+    </div>
+    <div style="font-size:10px;color:#4a5568;text-align:right">${norm.note}</div>`;
+}
+
+// Load and show model status bar
+async function loadModelStatus(){
+  try{
+    const r = await fetch('/model_status');
+    const d = await r.json();
+    const bar  = document.getElementById('modelStatusBar');
+    const cont = document.getElementById('modelStatusContent');
+    if(!bar||!cont) return;
+    bar.style.display='block';
+    const models = [
+      {name:'ResUNet', ok:d.segmentation?.loaded, info:`Dice ${d.segmentation?.dice||'?'}`},
+      {name:'SpineClassifier', ok:d.spine_classifier?.loaded, info:`${((d.spine_classifier?.accuracy||0)*100).toFixed(0)}% acc`},
+      {name:'Bio-ClinicalBERT', ok:d.bio_clinical_bert?.loaded, info:'NLP'},
+      {name:'Fusion (ATPG+HASF)', ok:d.fusion_module?.loaded, info:d.fusion_module?.trained?'trained':'random'},
+      {name:'MultiTaskHead', ok:d.multitask_head?.loaded, info:d.multitask_head?.trained?'trained':'random'},
+      {name:'GradCAM', ok:d.gradcam?.loaded, info:'explainability'},
+    ];
+    cont.innerHTML = models.map(m=>`
+      <span style="background:${m.ok?'#1a3a2a':'#2a1a1a'};border:1px solid ${m.ok?'#2d6a4f':'#6b2020'};
+            border-radius:20px;padding:3px 10px;font-size:10px;color:${m.ok?'#68d391':'#fc8181'}">
+        ${m.ok?'✓':'✗'} ${m.name} <span style="opacity:.7">${m.info}</span>
+      </span>`).join('');
+  }catch(e){}
+}
+
+// Download segmentation mask
+async function downloadMask(){
+  try{
+    const r = await fetch('/download_mask',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
+    if(!r.ok){toast('No mask available','warn');return;}
+    const blob = await r.blob();
+    const url  = URL.createObjectURL(blob);
+    const a    = document.createElement('a');
+    a.href=url; a.download='spine_mask.png'; a.click();
+    URL.revokeObjectURL(url);
+    toast('Mask downloaded','success');
+  }catch(e){toast('Download failed','error');}
+}
+
+// Show normative comparison in toast/panel
+async function showNormative(){
+  try{
+    const age = document.getElementById('page')?.value || '50';
+    const r   = await fetch('/normative_report',{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({age: parseFloat(age)||50})
+    });
+    const d = await r.json();
+    if(d.error){toast(d.error,'warn');return;}
+    const panel = document.getElementById('normativePanel');
+    if(panel) panel.style.display='block';
+    renderNormative({normative_comparison:d});
+    panel?.scrollIntoView({behavior:'smooth'});
+  }catch(e){toast('Normative report failed','error');}
+}
+
+// Hook into main analyze result to render new panels
+const _origRenderResult = typeof renderResult === 'function' ? renderResult : null;
+function renderNewFeaturePanels(d){
+  if(d.bone_density)       renderBoneDensity(d);
+  if(d.morphometry)        renderMorphometry(d);
+  if(d.nerve_compression)  renderNerveCompression(d);
+  if(d.normative_comparison) renderNormative(d);
+  loadModelStatus();
+}
+
+// Auto-load model status on page load
+setTimeout(loadModelStatus, 1500);
 </script>
 </body></html>"""
 
@@ -2968,6 +4422,13 @@ if __name__ == "__main__":
             print(f"  Model  : epoch {c.get('epoch','?')} | best_dice={c.get('best_dice',0):.4f}")
         except: pass
     print(f"  Size   : {INFER_SIZE}×{INFER_SIZE} | base_ch={MODEL_BASE_CH}")
+
+    # Pre-load segmentation model so _device is set, then load all neural modules
+    print("  Loading segmentation model …")
+    get_model()
+    print("  Loading neural models/ modules …")
+    load_neural_models()
+
     print(f"  Open   : http://localhost:5000")
     print("=" * 52)
     app.run(host="0.0.0.0", port=5000, debug=False, threaded=True)

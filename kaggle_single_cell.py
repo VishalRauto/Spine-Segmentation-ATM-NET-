@@ -11,7 +11,6 @@ import sys, types, os, functools
 
 os.environ['TORCHDYNAMO_DISABLE'] = '1'
 os.environ['TORCH_COMPILE_DISABLE'] = '1'
-os.environ['PYTORCH_ALLOC_CONF'] = 'expandable_segments:True'  # prevents OOM fragmentation
 
 try:
     import torch
@@ -103,8 +102,8 @@ import SimpleITK as sitk
 
 # ── CONFIG ────────────────────────────────────────────────────────
 IMG_SIZE   = 384   # 384×384 — good balance speed vs quality
-BATCH_SIZE = 5     # reduced from 8 to prevent OOM on long runs
-ACCUM      = 5     # keeps effective BS=25
+BATCH_SIZE = 8     # T4 16GB fits BS=8 at 384px with AMP
+ACCUM      = 3     # effective BS=24
 EPOCHS     = 300   # 300 epochs — need this many for 0.85+
 LR         = 4e-4  # slightly lower than 5e-4 — more stable
 LR_MIN     = 8e-6
@@ -472,14 +471,15 @@ else:
 
 optimizer=torch.optim.AdamW(model.parameters(),lr=LR,weight_decay=WD,
                             foreach=False, fused=False)  # prevent compile trigger
-
-# Use CosineAnnealingLR — works correctly across sessions unlike OneCycleLR
-# OneCycleLR resets every session causing plateau; CosineAnnealing is stable
-sched=torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
-    optimizer,
-    T_0=50,        # restart every 50 epochs → warm restarts help escape plateaus
-    T_mult=2,      # each restart is 2× longer
-    eta_min=LR_MIN
+# Use OneCycleLR
+sched=torch.optim.lr_scheduler.OneCycleLR(
+    optimizer, max_lr=LR,
+    steps_per_epoch=len(tr_dl),
+    epochs=EPOCHS-start_ep+1,
+    pct_start=WARMUP_EP/max(EPOCHS,1),
+    anneal_strategy='cos',
+    div_factor=25,
+    final_div_factor=1e4
 )
 # Use GradScaler — disable if it causes issues
 try:
@@ -499,7 +499,7 @@ torch.set_grad_enabled(True)
 
 # ── TRAINING LOOP ─────────────────────────────────────────────────
 for ep in range(start_ep,EPOCHS+1):
-    lr_now=optimizer.param_groups[0]['lr']
+    lr_now=sched.get_last_lr()[0] if hasattr(sched,'get_last_lr') else LR
 
     model.train()  # ensure train mode — critical after eval() in resume/validation
     losses=[]; t0=time.time()
@@ -521,10 +521,10 @@ for ep in range(start_ep,EPOCHS+1):
                 nn.utils.clip_grad_norm_(model.parameters(),1.0)
                 optimizer.step()
             optimizer.zero_grad(set_to_none=True)
-        sched.step(ep + step/len(tr_dl))  # CosineAnnealingWarmRestarts steps per batch
+        sched.step()  # OneCycleLR steps every batch
         losses.append(loss.item()*ACCUM)
     tr_loss=float(np.mean(losses)); ep_sec=time.time()-t0
-    lr_now=optimizer.param_groups[0]['lr']
+    lr_now=sched.get_last_lr()[0]
 
     model.eval(); Dc=defaultdict(list)
     with torch.no_grad():

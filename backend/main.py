@@ -51,6 +51,19 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"Model warm-up: {e}")
 
+    # Pre-warm NLP models in background (Bio-ClinicalBERT + zero-shot)
+    import asyncio as _asyncio
+    async def _prewarm_nlp():
+        try:
+            from server import get_bert, get_zero_shot
+            await _asyncio.get_event_loop().run_in_executor(None, get_bert)
+            logger.info("Bio-ClinicalBERT pre-warmed")
+            await _asyncio.get_event_loop().run_in_executor(None, get_zero_shot)
+            logger.info("Zero-shot classifier pre-warmed")
+        except Exception as _e:
+            logger.info(f"NLP pre-warm skipped: {_e}")
+    _asyncio.ensure_future(_prewarm_nlp())
+
     yield
 
     logger.info("Shutting down ATM-Net++ API server")

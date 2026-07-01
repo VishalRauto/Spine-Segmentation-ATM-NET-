@@ -19,6 +19,7 @@ from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, s
 from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
+import asyncio
 
 from backend.api.middleware.auth_middleware import get_current_active_user
 from backend.api.schemas.schemas import PredictionRequest, PredictionResponse
@@ -84,7 +85,7 @@ async def upload_and_predict(
             detail=f"File too large: {size_mb:.1f}MB. Max: {settings.MAX_UPLOAD_SIZE_MB}MB",
         )
 
-    # Save to temp file
+    # Save to temp file (needed only for legacy SpinePredictor path)
     upload_dir = settings.upload_dir_path
     temp_name = f"{uuid.uuid4()}{ext}"
     temp_path = upload_dir / temp_name
@@ -94,13 +95,22 @@ async def upload_and_predict(
     try:
         predictor = await get_predictor()
         demographics = _build_demographics(age, sex, height_cm, weight_kg, bmi)
+        if demographics and report_text:
+            demographics["notes"] = report_text
 
-        result = predictor.predict_from_file(
-            image_path=str(temp_path),
-            report_text=report_text,
-            demographics=demographics,
-            modality=modality,
-        )
+        # Support both ResUNetPredictor (new) and SpinePredictor (legacy)
+        if hasattr(predictor, "predict"):
+            result = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: predictor.predict(content, filename, report_text, demographics)
+            )
+        else:
+            result = predictor.predict_from_file(
+                image_path=str(temp_path),
+                report_text=report_text,
+                demographics=demographics,
+                modality=modality,
+            )
 
         return _build_prediction_response(result)
 

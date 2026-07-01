@@ -12,13 +12,18 @@ from backend.core.config import get_settings
 
 settings = get_settings()
 
-engine = create_async_engine(
-    settings.DATABASE_URL,
-    pool_size=settings.DATABASE_POOL_SIZE,
-    max_overflow=settings.DATABASE_MAX_OVERFLOW,
-    echo=settings.DEBUG,
-    pool_pre_ping=True,
-)
+# SQLite doesn't support pool_size / max_overflow — detect and configure accordingly
+_is_sqlite = settings.DATABASE_URL.startswith("sqlite")
+
+_engine_kwargs: dict = {"echo": settings.DEBUG, "pool_pre_ping": True}
+if not _is_sqlite:
+    _engine_kwargs["pool_size"] = settings.DATABASE_POOL_SIZE
+    _engine_kwargs["max_overflow"] = settings.DATABASE_MAX_OVERFLOW
+else:
+    # SQLite needs check_same_thread=False via connect_args
+    _engine_kwargs["connect_args"] = {"check_same_thread": False}
+
+engine = create_async_engine(settings.DATABASE_URL, **_engine_kwargs)
 
 AsyncSessionLocal = async_sessionmaker(
     engine,
